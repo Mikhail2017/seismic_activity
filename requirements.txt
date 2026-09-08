@@ -1,0 +1,28 @@
+# Core tools (viewer, export, analysis) — self-contained, no hardpicks-dev needed.
+h5py==3.16.0
+numpy==2.4.6
+matplotlib==3.11.1
+gradio==6.26.0
+tqdm==4.70.0
+
+# hardpicks must be an *editable* install so its TOP_DIR/config/data paths resolve.
+# Plain `pip install git+...` puts the package in site-packages and breaks hardpicks paths.
+-e git+https://github.com/mila-iqia/hardpicks.git@716d68ec8786bf6b866f6d302ea9281a23c2d4f1#egg=hardpicks
+
+# Training / hardpicks runtime (Python 3.11-compatible substitutes for hardpicks-dev pins).
+# Original hardpicks-dev used torch==1.12 / pytorch-lightning==1.5 on Python 3.8;
+# if you hit API breakage, prefer fixing imports or using a dedicated hardpicks-dev env.
+torch>=2.1,<2.5
+torchvision>=0.16,<0.20
+pytorch-lightning>=1.9,<2.3
+segmentation-models-pytorch>=0.3,<0.4
+einops>=0.6
+scipy>=1.10
+opencv-python-headless>=4.8
+scikit-learn>=1.2
+PyYAML>=6.0
+mlflow>=2.0
+GitPython>=3.1
+rich>=12.0
+deepdiff>=6.0
+psutil>=5.9

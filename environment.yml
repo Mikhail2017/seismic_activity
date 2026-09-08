@@ -1,0 +1,13 @@
+# Local / full machine install (creates its own conda env including torch).
+# For Lightning AI cloud nodes, use setup_lightning.sh + requirements-lightning.txt instead.
+name: seismic_activity
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      - -r requirements.txt
