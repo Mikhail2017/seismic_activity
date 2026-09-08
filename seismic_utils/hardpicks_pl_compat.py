@@ -20,8 +20,6 @@ def ensure_hardpicks_lightning_compat() -> str:
     Returns a short status string for logging.
     """
     global _APPLIED
-    if _APPLIED:
-        return "already-applied"
 
     import pytorch_lightning as pl
     import pytorch_lightning.utilities.types as pl_types
@@ -40,9 +38,31 @@ def ensure_hardpicks_lightning_compat() -> str:
     import hardpicks.models.base as base_mod
 
     BaseModel = base_mod.BaseModel
+
+    def _strip_removed_hooks(cls) -> list[str]:
+        removed = []
+        for name in (
+            "training_epoch_end",
+            "validation_epoch_end",
+            "test_epoch_end",
+            "on_epoch_start",
+            "on_epoch_end",
+        ):
+            if name in cls.__dict__:
+                delattr(cls, name)
+                removed.append(name)
+        return removed
+
+    # Always strip removed hooks — PL2 errors if they exist at all.
+    stripped = _strip_removed_hooks(BaseModel)
+
     if getattr(BaseModel, "_seismic_pl2_compat", False):
         _APPLIED = True
-        return f"pl-{pl.__version__}-class-already-patched"
+        extra = f"+stripped:{','.join(stripped)}" if stripped else ""
+        return f"pl-{pl.__version__}-class-already-patched{extra}"
+
+    if _APPLIED and not stripped:
+        return "already-applied"
 
     _orig_init = BaseModel.__init__
     _orig_train_step = BaseModel.training_step
@@ -125,11 +145,8 @@ def ensure_hardpicks_lightning_compat() -> str:
     BaseModel.on_train_epoch_end = on_train_epoch_end
     BaseModel.on_validation_epoch_end = on_validation_epoch_end
     BaseModel.on_test_epoch_end = on_test_epoch_end
-    # PL2 ignores these; keep no-ops so accidental calls don't explode.
-    BaseModel.training_epoch_end = lambda self, outputs=None: None  # type: ignore[assignment]
-    BaseModel.validation_epoch_end = lambda self, outputs=None: None  # type: ignore[assignment]
-    BaseModel.test_epoch_end = lambda self, outputs=None: None  # type: ignore[assignment]
-    BaseModel._seismic_pl2_compat = True
+    _strip_removed_hooks(BaseModel)
 
+    BaseModel._seismic_pl2_compat = True
     _APPLIED = True
     return f"pl-{pl.__version__}-patched"
