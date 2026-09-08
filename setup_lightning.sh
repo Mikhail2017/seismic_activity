@@ -26,12 +26,19 @@ print(f"==> Found torch {torch.__version__} (cuda={torch.cuda.is_available()})")
 try:
     import torchvision
     print(f"==> Found torchvision {torchvision.__version__}")
-except Exception:
-    print("==> WARNING: torchvision missing; install it only if hardpicks/models need it")
+except Exception as exc:
+    print(
+        "ERROR: torchvision missing. hardpicks.data.transforms and models.resnet require it.\n"
+        "       Install a build matching the image torch, e.g.:\n"
+        "         pip install torchvision --index-url https://download.pytorch.org/whl/cu121\n"
+        f"       ({type(exc).__name__}: {exc})",
+        flush=True,
+    )
+    raise SystemExit(1)
 PY
 
-echo "==> Upgrading pip/setuptools/wheel"
-$PYTHON -m pip install --upgrade pip setuptools wheel
+echo "==> Installing/pinning pip tooling (setuptools must stay <82 for pkg_resources)"
+$PYTHON -m pip install --upgrade "pip" "wheel>=0.40" "packaging>=23" "setuptools>=68,<82"
 
 echo "==> Installing deps from ${REQ_FILE} (no torch reinstall)"
 $PYTHON -m pip install -r "$REQ_FILE"
@@ -44,17 +51,62 @@ fi
 echo "==> Verifying imports"
 $PYTHON - <<'PY'
 from pathlib import Path
-import torch
+import importlib
+import sys
+
+sys.path.insert(0, str(Path(".").resolve()))
+
+required = [
+    "torch",
+    "pytorch_lightning",
+    "hardpicks",
+    "h5py",
+    "numpy",
+    "scipy",
+    "pandas",
+    "PIL",
+    "cv2",
+    "yaml",
+    "einops",
+    "mlflow",
+    "mock",
+    "orion",
+    "deepdiff",
+    "segmentation_models_pytorch",
+    "timm",
+    "pretrainedmodels",
+    "fairscale",
+    "tqdm",
+]
+missing = []
+for name in required:
+    try:
+        importlib.import_module(name)
+    except Exception as exc:
+        missing.append(f"{name}: {type(exc).__name__}: {exc}")
+
+if missing:
+    print("MISSING/FAILED:")
+    for m in missing:
+        print(" ", m)
+    raise SystemExit(1)
+
 import hardpicks
+import torch
+import torchvision
+from seismic_utils.hardpicks_pl_compat import ensure_hardpicks_lightning_compat
+
+print("PL compat:", ensure_hardpicks_lightning_compat())
+import hardpicks.data.fbp.data_module  # noqa: F401
+import hardpicks.models.fbp.unet  # noqa: F401
 
 print("torch:", torch.__version__)
+print("torchvision:", torchvision.__version__)
 print("hardpicks:", hardpicks.__file__)
 print("TOP_DIR:", hardpicks.TOP_DIR)
 assert (Path(hardpicks.TOP_DIR) / "config").is_dir(), (
     "hardpicks is not editable — config/ missing under TOP_DIR"
 )
-import hardpicks.data.fbp.gather_parser  # noqa: F401
-import h5py, numpy, matplotlib, tqdm  # noqa: F401
 print("verify OK")
 PY
 

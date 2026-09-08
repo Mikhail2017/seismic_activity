@@ -6,18 +6,29 @@
 # or:
 #   pip install -r requirements-lightning.txt
 
+# setuptools provides pkg_resources (still required by lightning_fabric).
+# setuptools>=82 removed pkg_resources → breaks `import pytorch_lightning`.
+setuptools>=68,<82
+wheel>=0.40
+packaging>=23
+
 # Core project tools
 h5py>=3.10
 numpy>=1.24
 matplotlib>=3.7
+pandas>=2.0
+pillow>=9.0
 gradio>=4.0
 tqdm>=4.66
 
 # hardpicks must be editable so TOP_DIR/config/data paths resolve.
 -e git+https://github.com/mila-iqia/hardpicks.git@716d68ec8786bf6b866f6d302ea9281a23c2d4f1#egg=hardpicks
 
-# Training extras (torch/torchvision intentionally omitted)
-pytorch-lightning>=1.9,<2.3
+# Training stack (torch/torchvision intentionally omitted — provided by the cloud image)
+# hardpicks was written for PL 1.x; PL 2.x is OK if you call
+# seismic_utils.hardpicks_pl_compat.ensure_hardpicks_lightning_compat() before model imports
+# (the training notebook / setup_lightning.sh do this).
+pytorch-lightning>=1.9,<2.5
 segmentation-models-pytorch>=0.3,<0.4
 einops>=0.6
 scipy>=1.10
@@ -29,3 +40,20 @@ GitPython>=3.1
 rich>=12.0
 deepdiff>=6.0
 psutil>=5.9
+mock>=4.0
+
+# Imported at hardpicks data/model import time (not optional)
+# hp_utils is pulled by gather_preprocess → transforms → data_module
+# PyPI orion<=0.2.7 fails to build on Python 3.12 (SafeConfigParser removed).
+# Use the GitHub tag that fixed versioneer; notebook training only needs IS_ORION_ON=False.
+orion @ git+https://github.com/Epistimio/orion.git@v0.2.8
+# U-Net / SMP encoder stack
+timm>=0.6
+pretrainedmodels>=0.7
+fairscale>=0.4
+opt-einsum>=3.3
+pynvml>=11.0
+
+# torchvision is NOT listed here (avoid clobbering the image torch build), but it is
+# REQUIRED by hardpicks.data.transforms and hardpicks.models.resnet. setup_lightning.sh
+# fails fast if it is missing — install a matching wheel yourself if needed.
