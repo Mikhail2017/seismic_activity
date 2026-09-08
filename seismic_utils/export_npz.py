@@ -6,20 +6,36 @@ import argparse
 import csv
 import json
 import re
+import sys
 from pathlib import Path
 
 import numpy as np
 from tqdm import tqdm
 
-from .dataset import (
-    DEFAULT_DATA_DIR,
-    ShotGather,
-    build_line_gather_index_from_group,
-    load_line_gather_from_ref,
-    open_trace_group,
-)
-from .hardpicks_bridge import HardpicksGatherStore, hardpicks_available
-from .sites import resolve_site_config
+if __package__ in (None, ""):
+    # Allow `python seismic_utils/export_npz.py ...` from repo root or this dir.
+    _repo_root = Path(__file__).resolve().parent.parent
+    if str(_repo_root) not in sys.path:
+        sys.path.insert(0, str(_repo_root))
+    from seismic_utils.dataset import (
+        DEFAULT_DATA_DIR,
+        ShotGather,
+        build_line_gather_index_from_group,
+        load_line_gather_from_ref,
+        open_trace_group,
+    )
+    from seismic_utils.hardpicks_bridge import HardpicksGatherStore, hardpicks_available
+    from seismic_utils.sites import resolve_site_config
+else:
+    from .dataset import (
+        DEFAULT_DATA_DIR,
+        ShotGather,
+        build_line_gather_index_from_group,
+        load_line_gather_from_ref,
+        open_trace_group,
+    )
+    from .hardpicks_bridge import HardpicksGatherStore, hardpicks_available
+    from .sites import resolve_site_config
 
 
 def infer_asset_name(hdf5_path: str | Path, asset: str | None = None) -> str:

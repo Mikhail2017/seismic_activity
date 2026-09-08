@@ -41,6 +41,7 @@ Gathers are **shot × receiver-line** images (task description / hardpicks split
 - `seismic_utils/hardpicks_bridge.py` — reuse hardpicks `ShotLineGatherDataset` when available
 - `seismic_utils/plotting.py` — gather plots + optional before/after/unlabeled overlay
 - `seismic_utils/export_npz.py` — per line-gather NPZ export
+- `seismic_utils/npz_parser.py` — fast hardpicks-compatible dataset from NPZ
 - `viewer.py` — Gradio UI
 - `plot_class_balance.py` — global class histogram
 
@@ -63,6 +64,28 @@ python -m seismic_utils.export_npz ... --backend native
 ```bash
 python -m seismic_utils.export_npz /path/to/asset.hdf5 -o /path/to/npz
 ```
+
+## Train from NPZ (fast I/O)
+
+After export, use the NPZ parser instead of live HDF5 reads:
+
+```python
+from seismic_utils.npz_parser import create_npz_parser
+
+train_parser = create_npz_parser(
+    "Lalor",
+    npz_root="/path/to/npz",
+    prefix="train",
+    site_params={
+        "normalize_samples": True,
+        "augmentations": [{"type": "flip"}],
+        "subset": {"eval_ratio": 0.15, "use_eval_split": False},
+    },
+    segm_class_count=1,
+)
+```
+
+See `examples/local/fbp_train_with_api.ipynb` (`DATA_BACKEND = "npz"`).
 
 ## Training notebook
 
