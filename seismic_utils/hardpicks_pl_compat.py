@@ -15,12 +15,22 @@ _APPLIED = False
 _COMPAT_VERSION = 2  # bump when patch behavior changes
 
 
+def _patch_numpy_nan_alias() -> None:
+    """hardpicks uses ``np.NaN``, removed in NumPy 2."""
+    import numpy as np
+
+    if not hasattr(np, "NaN"):
+        np.NaN = np.nan  # type: ignore[attr-defined]
+
+
 def ensure_hardpicks_lightning_compat() -> str:
     """Stub removed PL types and rewrite epoch-end hooks for PL 2.x.
 
     Returns a short status string for logging.
     """
     global _APPLIED
+
+    _patch_numpy_nan_alias()
 
     import pytorch_lightning as pl
     import pytorch_lightning.utilities.types as pl_types

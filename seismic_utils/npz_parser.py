@@ -202,7 +202,6 @@ def npz_file_to_hardpicks_gather(
             "sample_rate_ms": sample_rate_us / 1000.0,
             "dead_rec_mask": np.isclose(samples, 0, atol=_DEAD_TRACE_EPS).all(axis=1),
             "samples": samples,
-            "npz_path": str(path),
         }
         if provide_offset_dists:
             gather["offset_distances"] = _offset_distances_from_npz(
@@ -281,7 +280,6 @@ def _meta_from_npz_file(
             "trace_count": n_traces,
             "sample_count": n_samples,
             "sample_rate_ms": sample_rate_us / 1000.0,
-            "npz_path": str(path),
         }
         if provide_offset_dists:
             meta["offset_distances"] = _offset_distances_from_npz(
