@@ -93,16 +93,28 @@ train_parser = create_npz_parser(
 )
 ```
 
-See `examples/local/fbp_train_with_api.ipynb` (`DATA_BACKEND = "npz"`).
+See `examples/local/fbp_train.py` or the notebook (`DATA_BACKEND = "npz"`).
 
-## Training notebook
+## Training
 
-Adapted from hardpicks `fbp_train_with_api.ipynb`:
+CLI script (recommended) — TensorBoard + CSV logs, step/epoch progress with loss and metrics:
 
 ```bash
 conda activate seismic_activity   # or Lightning Studio kernel after setup_lightning.sh
+python examples/local/fbp_train.py --sites Brunswick,Halfmile --backend npz --epochs 5
+
+# watch metrics
+tensorboard --logdir output/train_brunswick_halfmile/tensorboard
+```
+
+Useful flags: `--batch-size`, `--num-workers`, `--npz-root`, `--output-dir`,
+`--print-every-n-steps` (stdout train loss), `--no-final-validate`.
+
+Notebook equivalent:
+
+```bash
 jupyter notebook examples/local/fbp_train_with_api.ipynb
 ```
 
-Knobs at the top of the notebook: `SITE_NAME`, `MAX_EPOCHS`, `BATCH_SIZE`, `DATA_DIR`.
-After `fit`, it prints per-epoch train/valid metrics, saves `train_valid_curves.png`, and re-validates the best checkpoint.
+Both write under `output/train_<sites>/`: best checkpoint (`valid/HitRate1px`),
+`epoch_metrics.csv`, and `train_valid_curves.png`.
