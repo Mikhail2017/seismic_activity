@@ -61,13 +61,17 @@ def open_hardpicks_dataset(
     site_name: str | None = None,
     convert_to_fp16: bool = False,
     convert_to_int16: bool = False,
-    provide_offset_dists: bool = True,
-    cache_trace_metadata: bool = True,
+    provide_offset_dists: bool = False,
+    cache_trace_metadata: bool = False,
 ):
     """
     Open an official hardpicks ``ShotLineGatherDataset``.
 
-    Defaults disable fp16/int16 casting so exploration/export keep full precision.
+    Defaults match hardpicks (no metadata cache, no offset channels). Pass
+    ``provide_offset_dists=True`` when the caller needs geometry channels
+    (training / prediction). Avoid ``cache_trace_metadata=True`` unless you
+    will repeatedly re-read the same gathers — filling the cache for a full
+    site is very expensive.
     """
     from hardpicks.data.fbp.gather_parser import create_shot_line_gather_dataset
 
@@ -150,18 +154,23 @@ def build_line_gather_index_hardpicks(
     """
     Build ``LineGatherRef`` list from a hardpicks dataset (exact official split).
 
+    Uses in-memory gather maps only — does **not** call ``get_meta_gather`` for
+    every gather (that path also builds offset arrays and was extremely slow on
+    large sites).
+
     Returns ``(refs, dataset)`` so callers can keep the open parser for loading.
     """
     ds = dataset or open_hardpicks_dataset(hdf5_path, site=site)
     refs: list[LineGatherRef] = []
     for gather_id in range(len(ds)):
-        meta = ds.get_meta_gather(gather_id)
+        gather_trace_ids = np.asarray(ds.gather_to_trace_map[gather_id], dtype=np.int64)
+        first_trace_id = int(gather_trace_ids[0])
         refs.append(
             LineGatherRef(
                 gather_id=int(gather_id),
-                shot_id=int(meta["shot_id"]),
-                line_id=int(meta["rec_line_id"]),
-                trace_indices=np.asarray(meta["gather_trace_ids"], dtype=np.int64),
+                shot_id=int(ds.trace_to_shot_map[first_trace_id]),
+                line_id=int(ds.trace_to_line_map[first_trace_id]),
+                trace_indices=gather_trace_ids,
             )
         )
     return refs, ds
@@ -176,18 +185,91 @@ def load_line_gather_hardpicks(
 
 
 class HardpicksGatherStore:
-    """Cached hardpicks-backed gather access for viewer/export."""
+    """Hardpicks-backed gather access for viewer/export.
 
-    def __init__(self, hdf5_path: str | Path, *, site: SiteConfig | None = None):
+    Parameters
+    ----------
+    defer_open:
+        If True, skip opening the TraceParser until the first load/predict.
+        Pass *refs* (e.g. from the native index) so the dropdown can list gathers
+        without paying the hardpicks open cost.
+    refs:
+        Optional prebuilt gather list used when ``defer_open=True``.
+    """
+
+    def __init__(
+        self,
+        hdf5_path: str | Path,
+        *,
+        site: SiteConfig | None = None,
+        provide_offset_dists: bool = True,
+        cache_trace_metadata: bool = False,
+        defer_open: bool = False,
+        refs: list[LineGatherRef] | None = None,
+    ):
         self.path = Path(ensure_hdf5_path(hdf5_path))
         self.site = site or resolve_site_config(self.path)
-        self.dataset = open_hardpicks_dataset(self.path, site=self.site)
-        self.refs, _ = build_line_gather_index_hardpicks(
-            self.path, site=self.site, dataset=self.dataset
+        self._provide_offset_dists = provide_offset_dists
+        self._cache_trace_metadata = cache_trace_metadata
+        self.dataset = None
+        self._shot_line_to_gid: dict[tuple[int, int], int] | None = None
+
+        if defer_open:
+            if refs is None:
+                raise ValueError("defer_open=True requires refs= (e.g. native index)")
+            self.refs = list(refs)
+        else:
+            self.ensure_open()
+            self.refs, _ = build_line_gather_index_hardpicks(
+                self.path, site=self.site, dataset=self.dataset
+            )
+
+    @property
+    def is_open(self) -> bool:
+        return self.dataset is not None
+
+    def ensure_open(self) -> None:
+        """Open the hardpicks TraceParser if needed (slow once per site)."""
+        if self.dataset is not None:
+            return
+        self.dataset = open_hardpicks_dataset(
+            self.path,
+            site=self.site,
+            provide_offset_dists=self._provide_offset_dists,
+            cache_trace_metadata=self._cache_trace_metadata,
         )
+        self._shot_line_to_gid = {}
+        for gather_id in range(len(self.dataset)):
+            gather_trace_ids = self.dataset.gather_to_trace_map[gather_id]
+            first_trace_id = int(gather_trace_ids[0])
+            key = (
+                int(self.dataset.trace_to_shot_map[first_trace_id]),
+                int(self.dataset.trace_to_line_map[first_trace_id]),
+            )
+            self._shot_line_to_gid[key] = int(gather_id)
 
     def __len__(self) -> int:
         return len(self.refs)
 
+    def _hardpicks_id(self, shot_id: int, line_id: int) -> int:
+        self.ensure_open()
+        assert self._shot_line_to_gid is not None
+        key = (int(shot_id), int(line_id))
+        if key not in self._shot_line_to_gid:
+            raise KeyError(f"No hardpicks gather for shot={shot_id} line={line_id}")
+        return self._shot_line_to_gid[key]
+
     def load(self, gather_id: int) -> ShotGather:
+        self.ensure_open()
         return load_line_gather_hardpicks(self.dataset, gather_id)
+
+    def load_by_shot_line(self, shot_id: int, line_id: int) -> ShotGather:
+        return self.load(self._hardpicks_id(shot_id, line_id))
+
+    def load_raw(self, gather_id: int) -> dict[str, Any]:
+        """Return the underlying hardpicks gather dict (for model inference)."""
+        self.ensure_open()
+        return self.dataset[gather_id]
+
+    def load_raw_by_shot_line(self, shot_id: int, line_id: int) -> dict[str, Any]:
+        return self.load_raw(self._hardpicks_id(shot_id, line_id))

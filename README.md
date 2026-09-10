@@ -34,28 +34,36 @@ Default data directory: `/home/mika/data/seismic_activity/`.
 
 Gathers are **shot × receiver-line** images (task description / hardpicks split).
 
+Browsing defaults to the **native** index/loader (fast). Predictions run on the
+already-loaded gather (no full hardpicks HDF5 open). Force official hardpicks browsing
+with `SEISMIC_BACKEND=hardpicks`.
+
+**Prediction mode:** open *Prediction model*, point at a `best*.ckpt` (or `output/train_*/`), click **Load model**, then set **Pick display** to `prediction` or `both` (lime = model, yellow/red = reference).
+
 ## Package layout
 
 - `seismic_utils/sites.py` — per-asset config (FB field, REC_PEG digit count)
 - `seismic_utils/dataset.py` — native HDF5 I/O + line-gather indexing
 - `seismic_utils/hardpicks_bridge.py` — reuse hardpicks `ShotLineGatherDataset` when available
 - `seismic_utils/plotting.py` — gather plots + optional before/after/unlabeled overlay
+- `seismic_utils/predict.py` — load FBPUNet checkpoint + per-gather FB prediction
 - `seismic_utils/export_npz.py` — per line-gather NPZ export
 - `seismic_utils/npz_parser.py` — fast hardpicks-compatible dataset from NPZ
-- `viewer.py` — Gradio UI
+- `viewer.py` — Gradio UI (reference / prediction / both pick display)
 - `plot_class_balance.py` — global class histogram
 
 ### hardpicks reuse
 
-**Default backend is hardpicks** (official `ShotLineGatherDataset`). Native splitter is opt-in.
+**Default browse backend is native** (fast). Prediction opens hardpicks on demand.
+Force official hardpicks loads with `SEISMIC_BACKEND=hardpicks`.
 
 ```bash
-# default (requires hardpicks + torch)
+# default (fast native browse; hardpicks opens on first prediction)
 python viewer.py
 python -m seismic_utils.export_npz /path/to/asset.hdf5 -o /path/to/npz
 
-# opt into native splitter
-SEISMIC_BACKEND=native python viewer.py
+# force hardpicks for browsing too (slower open)
+SEISMIC_BACKEND=hardpicks python viewer.py
 python -m seismic_utils.export_npz ... --backend native
 ```
 

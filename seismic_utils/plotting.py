@@ -15,20 +15,38 @@ UNLABELED_COLOR = (0.55, 0.55, 0.55)  # gray
 OVERLAY_ALPHA = 0.28
 
 
-def _region_masks(gather: ShotGather) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+PRED_COLOR = "lime"
+PICK_DISPLAY_MODES = ("reference", "prediction", "both")
+
+
+def _region_masks_from_fb(
+    gather: ShotGather,
+    first_breaks_ms: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Boolean masks shaped ``(n_samples, n_traces)``.
 
     Returns ``(before, after, unlabeled)``. Unlabeled covers every sample on
-    traces without a first-break pick.
+    traces without a finite first-break pick in *first_breaks_ms*.
     """
+    fb = np.asarray(first_breaks_ms, dtype=np.float64).reshape(-1)
+    if fb.shape[0] != gather.n_traces:
+        raise ValueError(
+            f"first_breaks_ms length {fb.shape[0]} != n_traces {gather.n_traces}"
+        )
+    labeled = np.isfinite(fb)
     time = gather.time_ms[:, None]  # (samples, 1)
-    fb = gather.first_breaks_ms[None, :]  # (1, traces)
-    labeled = gather.labeled_mask[None, :]
-    before = labeled & (time < fb)
-    after = labeled & (time >= fb)
-    unlabeled = np.broadcast_to(~gather.labeled_mask[None, :], before.shape).copy()
+    fb2 = fb[None, :]
+    labeled2 = labeled[None, :]
+    before = labeled2 & (time < fb2)
+    after = labeled2 & (time >= fb2)
+    unlabeled = np.broadcast_to(~labeled[None, :], before.shape).copy()
     return before, after, unlabeled
+
+
+def _region_masks(gather: ShotGather) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Region masks from ground-truth first breaks."""
+    return _region_masks_from_fb(gather, gather.first_breaks_ms)
 
 
 def plot_shot_gather(
@@ -36,6 +54,8 @@ def plot_shot_gather(
     *,
     show_first_breaks: bool = True,
     highlight_regions: bool = False,
+    predicted_first_breaks_ms: np.ndarray | None = None,
+    pick_display: str = "reference",
     clip_percentile: float = 99.0,
     figsize: tuple[float, float] = (10, 8),
 ) -> Figure:
@@ -48,7 +68,33 @@ def plot_shot_gather(
     When *highlight_regions* is True, samples before the first break are tinted
     blue, after are tinted red, unlabeled traces are tinted gray, and a
     class-count histogram is shown below the gather.
+
+    *pick_display* controls which pick curves are drawn (and which drive the
+    region tint): ``\"reference\"``, ``\"prediction\"``, or ``\"both\"``.
     """
+    mode = pick_display.strip().lower()
+    if mode not in PICK_DISPLAY_MODES:
+        raise ValueError(f"pick_display must be one of {PICK_DISPLAY_MODES}, got {pick_display!r}")
+
+    pred_ms = None
+    if predicted_first_breaks_ms is not None:
+        pred_ms = np.asarray(predicted_first_breaks_ms, dtype=np.float64).reshape(-1)
+        if pred_ms.shape[0] != gather.n_traces:
+            raise ValueError(
+                f"predicted_first_breaks_ms length {pred_ms.shape[0]} != n_traces {gather.n_traces}"
+            )
+
+    if mode in {"prediction", "both"} and pred_ms is None:
+        raise ValueError(f"pick_display={mode!r} requires predicted_first_breaks_ms")
+
+    # Region tint follows the active pick source (GT when showing both).
+    if mode == "prediction":
+        region_fb = pred_ms
+        hist_title = "Class balance (prediction)"
+    else:
+        region_fb = gather.first_breaks_ms
+        hist_title = "Class balance (reference)"
+
     amp = gather.traces.T  # (samples, traces) for imshow with time vertical
     limit = float(np.percentile(np.abs(amp), clip_percentile))
     if limit <= 0:
@@ -82,7 +128,7 @@ def plot_shot_gather(
     before_count = after_count = unlabeled_count = 0
     legend_handles: list = []
     if highlight_regions:
-        before, after, unlabeled = _region_masks(gather)
+        before, after, unlabeled = _region_masks_from_fb(gather, region_fb)
         before_count = int(before.sum())
         after_count = int(after.sum())
         unlabeled_count = int(unlabeled.sum())
@@ -108,14 +154,24 @@ def plot_shot_gather(
         )
     else:
         title = f"SHOTID {gather.shot_id}  ({gather.n_traces} traces)"
+    if mode != "reference":
+        title = f"{title}  |  picks={mode}"
     ax.set_title(title)
 
-    if show_first_breaks and np.any(gather.labeled_mask):
-        x = np.arange(gather.n_traces, dtype=np.float64)
+    x = np.arange(gather.n_traces, dtype=np.float64)
+    if show_first_breaks and mode in {"reference", "both"} and np.any(gather.labeled_mask):
         y = gather.first_breaks_ms.copy()
         line_color = "yellow" if highlight_regions else "red"
-        (line,) = ax.plot(x, y, color=line_color, linewidth=1.5, label="First break")
+        (line,) = ax.plot(x, y, color=line_color, linewidth=1.5, label="Reference FB")
         legend_handles.append(line)
+
+    if show_first_breaks and mode in {"prediction", "both"} and pred_ms is not None:
+        y_pred = pred_ms.copy()
+        if np.any(np.isfinite(y_pred)):
+            (pline,) = ax.plot(
+                x, y_pred, color=PRED_COLOR, linewidth=2.0, label="Predicted FB"
+            )
+            legend_handles.append(pline)
 
     if legend_handles:
         ax.legend(handles=legend_handles, loc="upper right")
@@ -126,7 +182,7 @@ def plot_shot_gather(
         colors = [BEFORE_COLOR, AFTER_COLOR, UNLABELED_COLOR]
         bars = ax_hist.bar(labels, counts, color=colors, edgecolor="black", linewidth=0.6)
         ax_hist.set_ylabel("Sample count")
-        ax_hist.set_title("Class balance")
+        ax_hist.set_title(hist_title)
         total = before_count + after_count + unlabeled_count
         for bar, count in zip(bars, counts):
             pct = 100.0 * count / total if total else 0.0

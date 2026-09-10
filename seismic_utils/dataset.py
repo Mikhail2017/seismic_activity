@@ -296,9 +296,18 @@ def _load_gather_from_indices(
     channel = _as_1d(_read_rows(group[CHANNEL_KEY], ordered_idx)).astype(np.int64, copy=False)
     rec_x = _as_1d(_read_rows(group[REC_X_KEY], ordered_idx)).astype(np.float64, copy=False)
     rec_y = _as_1d(_read_rows(group[REC_Y_KEY], ordered_idx)).astype(np.float64, copy=False)
+    # Match hardpicks: apply abs(COORD_SCALE) to XY / OFFSET (SEG-Y style integer coords).
+    xy_scale = 1.0
+    if "COORD_SCALE" in group:
+        raw_scale = float(_as_1d(_read_rows(group["COORD_SCALE"], ordered_idx[:1]))[0])
+        if raw_scale != 0.0:
+            xy_scale = abs(raw_scale)
+    rec_x = rec_x / xy_scale
+    rec_y = rec_y / xy_scale
     offset = None
     if OFFSET_KEY in group:
         offset = _as_1d(_read_rows(group[OFFSET_KEY], ordered_idx)).astype(np.float64, copy=False)
+        offset = offset / xy_scale
     if SAMP_RATE_KEY in group:
         sample_rate = float(_as_1d(_read_rows(group[SAMP_RATE_KEY], ordered_idx[:1]))[0])
     else:
