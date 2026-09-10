@@ -10,3 +10,7 @@ build/
 .env
 .venv/
 output/
+*.ckpt
+mlruns/
+mlflow.db
+**/mlflow.db
