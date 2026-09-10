@@ -1,25 +1,34 @@
 #!/usr/bin/env python3
-"""Train hardpicks FBPUNet on NPZ or HDF5 gathers (CLI version of fbp_train_with_api.ipynb).
+"""Train local FBPUNet (cloned from hardpicks) on NPZ or HDF5 gathers.
 
 Reports to TensorBoard + CSV, prints step/epoch loss and validation metrics, and
 saves the best checkpoint on ``valid/HitRate1px``.
 
+The trainer class lives in ``models.fbp.unet.FBPUNet``. Different “models” are
+encoder/architecture presets (ResNet18, EfficientNet-B0, …) or a YAML/JSON
+hyperparameter file. Optional SMP backbone pretraining via ``--encoder-weights``.
+
 Example::
 
     conda activate seismic_activity
-    python examples/local/fbp_train.py --sites Brunswick,Halfmile --epochs 5
+    python examples/local/fbp_train.py --sites Brunswick --model resnet18 --epochs 5
+    python examples/local/fbp_train.py --sites Brunswick --model efficientnet-b0 \\
+        --encoder-weights imagenet
+    python examples/local/fbp_train.py --sites Brunswick --model-config my_model.yaml
 
-    tensorboard --logdir output/train_brunswick_halfmile/tensorboard
+    tensorboard --logdir output/train_brunswick_resnet18/tensorboard
 """
 
 from __future__ import annotations
 
 import argparse
+import copy
 import functools
+import json
 import logging
 import sys
 from pathlib import Path
-from typing import Any, Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 import matplotlib
 
@@ -29,6 +38,7 @@ import pandas as pd
 import pytorch_lightning as pl
 import torch
 import torch.utils.data
+import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
@@ -43,6 +53,61 @@ logger = logging.getLogger("fbp_train")
 
 MONITOR_METRIC = "valid/HitRate1px"
 SEGMENTATION_CLASS_COUNT = 1
+
+# Named architecture presets (all use local models.fbp.unet.FBPUNet). Decoder / LR
+# follow hardpicks fold configs where available. Keys are CLI --model names.
+MODEL_PRESETS: Dict[str, Dict[str, Any]] = {
+    "resnet18": {
+        "unet_encoder_type": "resnet18",
+        "encoder_block_count": 5,
+        "mid_block_channels": 0,
+        "decoder_block_channels": "[256, 128, 64, 32, 16]",
+        "lr": 0.002136,
+    },
+    "resnet34": {
+        "unet_encoder_type": "resnet34",
+        "encoder_block_count": 5,
+        "mid_block_channels": 0,
+        "decoder_block_channels": "[256, 128, 64, 32, 16]",
+        "lr": 0.002136,
+    },
+    "resnet50": {
+        "unet_encoder_type": "resnet50",
+        "encoder_block_count": 5,
+        "mid_block_channels": 0,
+        "decoder_block_channels": "[512, 256, 128, 64, 32]",
+        "lr": 0.0015,
+    },
+    "efficientnet-b0": {
+        "unet_encoder_type": "timm-efficientnet-b0",
+        "encoder_block_count": 5,
+        "mid_block_channels": 0,
+        "decoder_block_channels": "[512, 256, 128, 64, 32]",
+        "lr": 0.003417,
+    },
+    "efficientnet-b4": {
+        "unet_encoder_type": "timm-efficientnet-b4",
+        "encoder_block_count": 5,
+        "mid_block_channels": 0,
+        "decoder_block_channels": "[512, 256, 128, 64, 32]",
+        "lr": 0.001053,
+    },
+    "vanilla": {
+        "unet_encoder_type": "vanilla",
+        "encoder_block_count": 5,
+        "mid_block_channels": 256,
+        "decoder_block_channels": "[256, 128, 64, 32, 16]",
+        "lr": 0.001,
+    },
+}
+
+# Allow hardpicks / SMP encoder spellings to resolve to the same preset.
+MODEL_ALIASES: Dict[str, str] = {
+    "timm-efficientnet-b0": "efficientnet-b0",
+    "timm-efficientnet-b4": "efficientnet-b4",
+    "fbpunet": "resnet18",
+    "fbp-unet": "resnet18",
+}
 
 TRAIN_AUGMENTATIONS = [
     {
@@ -61,8 +126,12 @@ COMMON_SITE_PARAMS = {
     "segm_first_break_buffer": 0,
 }
 
+# Keys that belong to train-script CLI / presets but are not FBPUNet hyperparams.
+_MODEL_CONFIG_META_KEYS = frozenset({"lr", "model_name", "preset"})
+
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    preset_names = ", ".join(sorted(MODEL_PRESETS))
     p = argparse.ArgumentParser(
         description="Train FBPUNet first-break picker (NPZ or HDF5).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -75,7 +144,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument(
         "--backend",
         choices=("npz", "hdf5"),
-        default="hdf5",
+        default="npz",
         help="Data backend: NPZ (fast) or live HDF5.",
     )
     p.add_argument(
@@ -98,7 +167,34 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--output-dir",
         type=Path,
         default=None,
-        help="Experiment directory (default: output/train_<sites>).",
+        help="Experiment directory (default: output/train_<sites>_<model>).",
+    )
+    p.add_argument(
+        "--model",
+        default="resnet18",
+        help=(
+            "Architecture preset name, or any SMP encoder id "
+            f"(presets: {preset_names})."
+        ),
+    )
+    p.add_argument(
+        "--model-config",
+        type=Path,
+        default=None,
+        help="YAML/JSON file of FBPUNet hyperparams (merged over the preset).",
+    )
+    p.add_argument(
+        "--encoder-weights",
+        default=None,
+        help=(
+            "SMP backbone pretrained weights (e.g. imagenet, ssl, swsl). "
+            "Default: train encoder from scratch. Ignored for vanilla encoder."
+        ),
+    )
+    p.add_argument(
+        "--list-models",
+        action="store_true",
+        help="Print available model presets and exit.",
     )
     p.add_argument(
         "--log-every-n-steps",
@@ -112,7 +208,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         default=50,
         help="Print train loss to stdout every N steps (0 disables).",
     )
-    p.add_argument("--lr", type=float, default=0.002136)
+    p.add_argument(
+        "--lr",
+        type=float,
+        default=None,
+        help="Learning rate (default: preset-specific, else 0.002136).",
+    )
     p.add_argument("--seed", type=int, default=0)
     p.add_argument(
         "--no-final-validate",
@@ -121,6 +222,190 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     p.add_argument("-v", "--verbose", action="store_true")
     return p.parse_args(argv)
+
+
+def resolve_model_name(name: str) -> str:
+    key = name.strip().lower().replace("_", "-")
+    if key in MODEL_ALIASES:
+        return MODEL_ALIASES[key]
+    if key in MODEL_PRESETS:
+        return key
+    # Accept SMP / hardpicks encoder ids as custom model labels.
+    return name.strip()
+
+
+def _load_config_file(path: Path) -> Dict[str, Any]:
+    path = path.expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"model config not found: {path}")
+    text = path.read_text()
+    if path.suffix.lower() in {".yaml", ".yml"}:
+        data = yaml.safe_load(text)
+    elif path.suffix.lower() == ".json":
+        data = json.loads(text)
+    else:
+        # Try YAML first, then JSON.
+        try:
+            data = yaml.safe_load(text)
+        except Exception:
+            data = json.loads(text)
+    if not isinstance(data, dict):
+        raise ValueError(f"model config must be a mapping, got {type(data).__name__}: {path}")
+    # Allow wrapping under a top-level "model:" key (common in larger configs).
+    if "unet_encoder_type" not in data and "encoder_type" not in data and isinstance(data.get("model"), dict):
+        data = data["model"]
+    return data
+
+
+def _decoder_for_encoder(encoder_type: str) -> Dict[str, Any]:
+    """Best-effort decoder defaults when --model is a raw SMP encoder name."""
+    enc = encoder_type.lower()
+    if enc.startswith("resnet") and not enc.startswith("resnet5") and "101" not in enc and "152" not in enc:
+        return {
+            "encoder_block_count": 5,
+            "mid_block_channels": 0,
+            "decoder_block_channels": "[256, 128, 64, 32, 16]",
+            "lr": 0.002136,
+        }
+    if "efficientnet" in enc or enc.startswith("resnet"):
+        return {
+            "encoder_block_count": 5,
+            "mid_block_channels": 0,
+            "decoder_block_channels": "[512, 256, 128, 64, 32]",
+            "lr": 0.0015,
+        }
+    if enc == "vanilla":
+        return {
+            "encoder_block_count": 5,
+            "mid_block_channels": 256,
+            "decoder_block_channels": "[256, 128, 64, 32, 16]",
+            "lr": 0.001,
+        }
+    return {
+        "encoder_block_count": 5,
+        "mid_block_channels": 0,
+        "decoder_block_channels": "[512, 256, 128, 64, 32]",
+        "lr": 0.0015,
+    }
+
+
+def build_model_config(
+    *,
+    model: str,
+    max_epochs: int,
+    lr: Optional[float] = None,
+    model_config_path: Optional[Path] = None,
+    encoder_weights: Optional[str] = None,
+) -> tuple[Dict[str, Any], str]:
+    """Build FBPUNet hyperparams from a preset and/or YAML/JSON override.
+
+    Returns ``(hyper_params, model_label)`` where ``model_label`` is used in
+    output paths and logs.
+    """
+    model_label = resolve_model_name(model)
+    if model_label in MODEL_PRESETS:
+        arch = copy.deepcopy(MODEL_PRESETS[model_label])
+    else:
+        # Treat as a raw encoder id (must be known to SMP at construct time).
+        arch = {"unet_encoder_type": model_label, **_decoder_for_encoder(model_label)}
+        model_label = model_label.replace("/", "-")
+
+    file_overrides: Dict[str, Any] = {}
+    if model_config_path is not None:
+        file_overrides = _load_config_file(model_config_path)
+        # If the file defines the encoder, prefer that for the label when no preset matched.
+        enc = file_overrides.get("unet_encoder_type") or file_overrides.get("encoder_type")
+        if enc and model.strip().lower() in {"", "custom"}:
+            model_label = str(enc)
+
+    preset_lr = float(arch.pop("lr", 0.002136))
+    file_lr = file_overrides.pop("lr", None)
+    if isinstance(file_lr, dict):
+        file_lr = None  # ignore accidental nested structures
+    # optimizer_params.lr in the file still wins later via deep merge below.
+
+    base = {
+        "model_type": "FBPUNet",
+        "unet_decoder_type": "vanilla",
+        "decoder_attention_type": None,
+        "segm_class_count": SEGMENTATION_CLASS_COUNT,
+        "use_dist_offsets": True,
+        "use_first_break_prior": False,
+        "coordconv": False,
+        "encoder_weights": None,
+        "optimizer_type": "Adam",
+        "optimizer_params": {"lr": preset_lr, "weight_decay": 1e-6},
+        "scheduler_type": "StepLR",
+        "scheduler_params": {"step_size": 10, "gamma": 0.1},
+        "update_scheduler_at_epochs": True,
+        "loss_type": "crossentropy",
+        "loss_params": {},
+        "use_full_metrics_during_training": False,
+        "eval_type": "FBPEvaluator",
+        "segm_first_break_prob_threshold": 0.0,
+        "eval_metrics": [
+            {"metric_type": "HitRate", "metric_params": {"buffer_size_px": 1}},
+            {"metric_type": "HitRate", "metric_params": {"buffer_size_px": 3}},
+            {"metric_type": "HitRate", "metric_params": {"buffer_size_px": 5}},
+            {"metric_type": "MeanBiasError"},
+            {"metric_type": "MeanAbsoluteError"},
+        ],
+        "gathers_to_display": 0,
+        "use_checkpointing": False,
+        "max_epochs": max_epochs,
+    }
+    base.update(arch)
+
+    # Merge file overrides (shallow + nested optimizer_params / scheduler_params).
+    for key, value in file_overrides.items():
+        if key in _MODEL_CONFIG_META_KEYS:
+            continue
+        if key in {"optimizer_params", "scheduler_params", "loss_params"} and isinstance(value, dict):
+            merged = dict(base.get(key) or {})
+            merged.update(value)
+            base[key] = merged
+        else:
+            base[key] = value
+
+    # CLI --lr always wins when provided.
+    if lr is not None:
+        opt = dict(base.get("optimizer_params") or {})
+        opt["lr"] = float(lr)
+        base["optimizer_params"] = opt
+    elif file_lr is not None:
+        opt = dict(base.get("optimizer_params") or {})
+        opt["lr"] = float(file_lr)
+        base["optimizer_params"] = opt
+
+    # CLI --encoder-weights wins over preset/file when provided.
+    if encoder_weights is not None:
+        ew = encoder_weights.strip()
+        base["encoder_weights"] = None if ew.lower() in {"", "none", "null"} else ew
+
+    base["max_epochs"] = max_epochs
+    base["model_type"] = base.get("model_type") or "FBPUNet"
+    if base["model_type"] != "FBPUNet":
+        raise ValueError(
+            f"Only model_type=FBPUNet is supported "
+            f"(got {base['model_type']!r}). Use --model / unet_encoder_type for architectures."
+        )
+    return base, model_label
+
+
+def list_models() -> None:
+    print("Available --model presets (all train local models.fbp.unet.FBPUNet):\n")
+    for name, cfg in sorted(MODEL_PRESETS.items()):
+        print(
+            f"  {name:18s}  encoder={cfg['unet_encoder_type']}"
+            f"  decoder={cfg['decoder_block_channels']}  lr={cfg['lr']}"
+        )
+    print("\nAliases:", ", ".join(f"{k}->{v}" for k, v in sorted(MODEL_ALIASES.items())))
+    print(
+        "\nAny segmentation_models_pytorch encoder name is also accepted "
+        "(decoder channels are inferred)."
+    )
+    print("Pretrained backbones: --encoder-weights imagenet  (or ssl/swsl/… per encoder)")
+    print("Override anything with --model-config path/to.yaml")
 
 
 def _gather_key(meta: dict) -> str:
@@ -278,41 +563,6 @@ def build_loaders(
         collate_fn=collate_fn,
     )
     return train_loader, valid_loader
-
-
-def build_model_config(max_epochs: int, lr: float) -> dict:
-    return {
-        "unet_encoder_type": "resnet18",
-        "unet_decoder_type": "vanilla",
-        "encoder_block_count": 5,
-        "mid_block_channels": 0,
-        "decoder_block_channels": "[256, 128, 64, 32, 16]",
-        "decoder_attention_type": None,
-        "segm_class_count": SEGMENTATION_CLASS_COUNT,
-        "use_dist_offsets": True,
-        "use_first_break_prior": False,
-        "coordconv": False,
-        "optimizer_type": "Adam",
-        "optimizer_params": {"lr": lr, "weight_decay": 1e-6},
-        "scheduler_type": "StepLR",
-        "scheduler_params": {"step_size": 10, "gamma": 0.1},
-        "update_scheduler_at_epochs": True,
-        "loss_type": "crossentropy",
-        "loss_params": {},
-        "use_full_metrics_during_training": False,
-        "eval_type": "FBPEvaluator",
-        "segm_first_break_prob_threshold": 0.0,
-        "eval_metrics": [
-            {"metric_type": "HitRate", "metric_params": {"buffer_size_px": 1}},
-            {"metric_type": "HitRate", "metric_params": {"buffer_size_px": 3}},
-            {"metric_type": "HitRate", "metric_params": {"buffer_size_px": 5}},
-            {"metric_type": "MeanBiasError"},
-            {"metric_type": "MeanAbsoluteError"},
-        ],
-        "gathers_to_display": 0,
-        "use_checkpointing": False,
-        "max_epochs": max_epochs,
-    }
 
 
 def _fmt_metric(value: Any) -> str:
@@ -548,6 +798,10 @@ def make_trainer(
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
+    if args.list_models:
+        list_models()
+        return 0
+
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -558,8 +812,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         raise SystemExit("--sites must list at least one site")
     site_label = "_".join(s.lower() for s in site_names)
 
+    model_config, model_label = build_model_config(
+        model=args.model,
+        max_epochs=args.epochs,
+        lr=args.lr,
+        model_config_path=args.model_config,
+        encoder_weights=args.encoder_weights,
+    )
+    model_slug = "".join(c if c.isalnum() or c in "-_" else "-" for c in model_label.lower())
+
     npz_root = args.npz_root or (args.data_dir / "npz")
-    output_root = (args.output_dir or (REPO_ROOT / "output" / f"train_{site_label}")).resolve()
+    output_root = (
+        args.output_dir
+        or (REPO_ROOT / "output" / f"train_{site_label}_{model_slug}")
+    ).resolve()
     output_root.mkdir(parents=True, exist_ok=True)
 
     print("PL compat:", ensure_hardpicks_lightning_compat())
@@ -567,15 +833,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         raise SystemExit("hardpicks (+ torch) required — run setup_lightning.sh / install requirements")
 
     import hardpicks
-    import hardpicks.models.fbp.unet as fbp_unet
+    import models.fbp.unet as fbp_unet
 
     pl.seed_everything(args.seed, workers=True)
 
     print("torch", torch.__version__, "| cuda", torch.cuda.is_available(), "| pl", pl.__version__)
     print("hardpicks", hardpicks.__file__)
+    print("FBPUNet module:", fbp_unet.__file__)
     print("Experiment dir:", output_root)
     print("Sites:", site_names)
+    print("Model:", model_label, "| encoder:", model_config.get("unet_encoder_type"))
+    print("encoder_weights:", model_config.get("encoder_weights"))
     print("DATA_BACKEND:", args.backend, "| NPZ_ROOT:", npz_root)
+
+    config_out = output_root / "model_config.yaml"
+    with config_out.open("w") as f:
+        yaml.safe_dump(model_config, f, sort_keys=False, default_flow_style=False)
+    print("Wrote", config_out)
 
     tbx_dir = output_root / "tensorboard"
     csv_dir = output_root / "csv_logs"
@@ -603,10 +877,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     print(f"Train batches: {len(train_loader)} | Valid batches: {len(valid_loader)}")
 
-    model = fbp_unet.FBPUNet(build_model_config(args.epochs, args.lr))
+    model = fbp_unet.FBPUNet(model_config)
     setattr(model, "_tbx_logger", tbx_logger)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"FBPUNet ready: {n_params / 1e6:.2f}M trainable parameters")
+    print(f"FBPUNet[{model_label}] ready: {n_params / 1e6:.2f}M trainable parameters")
 
     checkpoint_cb = pl.callbacks.ModelCheckpoint(
         dirpath=str(output_root),

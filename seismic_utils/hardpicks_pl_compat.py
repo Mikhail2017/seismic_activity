@@ -1,17 +1,18 @@
-"""Make hardpicks BaseModel importable/runnable on PyTorch Lightning 2.x.
+"""Make hardpicks / local ``models.base.BaseModel`` importable on PyTorch Lightning 2.x.
 
 hardpicks was written for PL 1.5–1.9 (`EPOCH_OUTPUT`, `training_epoch_end(outputs)`, …).
 Lightning AI cloud images ship PL 2.x where those APIs are gone.
 
 Call :func:`ensure_hardpicks_lightning_compat` **before** importing
-``hardpicks.models.fbp.unet`` (or any module that pulls ``hardpicks.models.base``).
+``models.fbp.unet`` or ``hardpicks.models.fbp.unet``.
 """
 
 from __future__ import annotations
 
+import importlib
 import typing
 
-_APPLIED = False
+_APPLIED_MODULES: dict[str, int] = {}
 _COMPAT_VERSION = 2  # bump when patch behavior changes
 
 
@@ -23,32 +24,17 @@ def _patch_numpy_nan_alias() -> None:
         np.NaN = np.nan  # type: ignore[attr-defined]
 
 
-def ensure_hardpicks_lightning_compat() -> str:
-    """Stub removed PL types and rewrite epoch-end hooks for PL 2.x.
-
-    Returns a short status string for logging.
-    """
-    global _APPLIED
-
-    _patch_numpy_nan_alias()
-
+def _patch_base_model_module(module_name: str) -> str:
+    """Apply PL2 shims to a BaseModel module (``models.base`` or ``hardpicks.models.base``)."""
     import pytorch_lightning as pl
-    import pytorch_lightning.utilities.types as pl_types
     import torch.utils.data
-
-    # Import-time annotations in hardpicks.models.base reference these aliases.
-    if not hasattr(pl_types, "EPOCH_OUTPUT"):
-        pl_types.EPOCH_OUTPUT = typing.Any  # type: ignore[attr-defined]
-    if not hasattr(pl_types, "STEP_OUTPUT"):
-        pl_types.STEP_OUTPUT = typing.Any  # type: ignore[attr-defined]
 
     major = int(str(pl.__version__).split(".", 1)[0])
     if major < 2:
-        _APPLIED = True
-        return f"pl-{pl.__version__}-noop"
+        _APPLIED_MODULES[module_name] = _COMPAT_VERSION
+        return f"{module_name}:pl-{pl.__version__}-noop"
 
-    import hardpicks.models.base as base_mod
-
+    base_mod = importlib.import_module(module_name)
     BaseModel = base_mod.BaseModel
 
     def _strip_removed_hooks(cls) -> list[str]:
@@ -74,7 +60,6 @@ def ensure_hardpicks_lightning_compat() -> str:
                 return obj
             if obj is None:
                 return None
-            # CombinedLoader (PL2): .loaders may be DataLoader, list, dict, …
             loaders = getattr(obj, "loaders", None)
             if loaders is not None and loaders is not obj:
                 obj = loaders
@@ -101,21 +86,10 @@ def ensure_hardpicks_lightning_compat() -> str:
         return obj
 
     def _get_dataloader_from_trainer(trainer, dataloader_name):
-        """PL1/PL2-compatible replacement for BaseModel._get_dataloader_from_trainer."""
-        # Map hardpicks names → attribute candidates on Trainer.
         aliases = {
-            "train_dataloader": (
-                "train_dataloader",
-                "train_dataloaders",
-            ),
-            "val_dataloader": (
-                "val_dataloader",
-                "val_dataloaders",
-            ),
-            "test_dataloader": (
-                "test_dataloader",
-                "test_dataloaders",
-            ),
+            "train_dataloader": ("train_dataloader", "train_dataloaders"),
+            "val_dataloader": ("val_dataloader", "val_dataloaders"),
+            "test_dataloader": ("test_dataloader", "test_dataloaders"),
         }
         names = aliases.get(dataloader_name, (dataloader_name,))
         last_exc: Exception | None = None
@@ -124,10 +98,9 @@ def ensure_hardpicks_lightning_compat() -> str:
                 continue
             try:
                 return _unwrap_loader(getattr(trainer, name))
-            except Exception as exc:  # noqa: BLE001 — try next alias
+            except Exception as exc:  # noqa: BLE001
                 last_exc = exc
 
-        # PL2 fallbacks via loop objects when Trainer attrs are absent/empty.
         loop_paths = {
             "train_dataloader": (
                 ("fit_loop", "_combined_loader"),
@@ -137,9 +110,7 @@ def ensure_hardpicks_lightning_compat() -> str:
                 ("fit_loop", "epoch_loop", "val_loop", "_combined_loader"),
                 ("validate_loop", "_combined_loader"),
             ),
-            "test_dataloader": (
-                ("test_loop", "_combined_loader"),
-            ),
+            "test_dataloader": (("test_loop", "_combined_loader"),),
         }
         for path in loop_paths.get(dataloader_name, ()):
             obj = trainer
@@ -154,18 +125,14 @@ def ensure_hardpicks_lightning_compat() -> str:
             f"Trainer has no usable dataloader for {dataloader_name!r}"
         ) from last_exc
 
-    # Always strip removed hooks — PL2 errors if they exist at all.
     stripped = _strip_removed_hooks(BaseModel)
-
-    # Always install the PL2 dataloader getter (idempotent).
     BaseModel._get_dataloader_from_trainer = staticmethod(_get_dataloader_from_trainer)
 
     prev = getattr(BaseModel, "_seismic_pl2_compat", 0)
-    # Old builds used True (==1). Treat any prior patch as "hooks already wrapped".
     if prev >= _COMPAT_VERSION:
-        _APPLIED = True
+        _APPLIED_MODULES[module_name] = prev
         extra = f"+stripped:{','.join(stripped)}" if stripped else ""
-        return f"pl-{pl.__version__}-class-already-patched-v{prev}{extra}"
+        return f"{module_name}:pl-{pl.__version__}-class-already-patched-v{prev}{extra}"
 
     def _on_gpu(self) -> bool:
         try:
@@ -231,7 +198,6 @@ def ensure_hardpicks_lightning_compat() -> str:
             prefix="test", losses=losses, evaluator=self.test_evaluator
         )
 
-    # Upgrade path: prior compat already wrapped steps — only refresh epoch hooks.
     if prev:
         BaseModel.on_train_epoch_start = on_train_epoch_start
         BaseModel.on_validation_epoch_start = on_validation_epoch_start
@@ -241,8 +207,8 @@ def ensure_hardpicks_lightning_compat() -> str:
         BaseModel.on_test_epoch_end = on_test_epoch_end
         _strip_removed_hooks(BaseModel)
         BaseModel._seismic_pl2_compat = _COMPAT_VERSION
-        _APPLIED = True
-        return f"pl-{pl.__version__}-upgraded-v{_COMPAT_VERSION}"
+        _APPLIED_MODULES[module_name] = _COMPAT_VERSION
+        return f"{module_name}:pl-{pl.__version__}-upgraded-v{_COMPAT_VERSION}"
 
     _orig_init = BaseModel.__init__
     _orig_train_step = BaseModel.training_step
@@ -284,5 +250,33 @@ def ensure_hardpicks_lightning_compat() -> str:
     _strip_removed_hooks(BaseModel)
 
     BaseModel._seismic_pl2_compat = _COMPAT_VERSION
-    _APPLIED = True
-    return f"pl-{pl.__version__}-patched-v{_COMPAT_VERSION}"
+    _APPLIED_MODULES[module_name] = _COMPAT_VERSION
+    return f"{module_name}:pl-{pl.__version__}-patched-v{_COMPAT_VERSION}"
+
+
+def ensure_hardpicks_lightning_compat() -> str:
+    """Stub removed PL types and rewrite epoch-end hooks for PL 2.x.
+
+    Patches both local ``models.base`` (preferred) and ``hardpicks.models.base``
+    when available. Returns a short status string for logging.
+    """
+    _patch_numpy_nan_alias()
+
+    import pytorch_lightning.utilities.types as pl_types
+
+    if not hasattr(pl_types, "EPOCH_OUTPUT"):
+        pl_types.EPOCH_OUTPUT = typing.Any  # type: ignore[attr-defined]
+    if not hasattr(pl_types, "STEP_OUTPUT"):
+        pl_types.STEP_OUTPUT = typing.Any  # type: ignore[attr-defined]
+
+    statuses: list[str] = []
+    for module_name in ("models.base", "hardpicks.models.base"):
+        try:
+            statuses.append(_patch_base_model_module(module_name))
+        except ModuleNotFoundError:
+            continue
+    if not statuses:
+        raise ModuleNotFoundError(
+            "Neither models.base nor hardpicks.models.base could be imported"
+        )
+    return "; ".join(statuses)

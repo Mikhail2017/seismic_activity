@@ -47,6 +47,7 @@ with `SEISMIC_BACKEND=hardpicks`.
 - `seismic_utils/hardpicks_bridge.py` — reuse hardpicks `ShotLineGatherDataset` when available
 - `seismic_utils/plotting.py` — gather plots + optional before/after/unlabeled overlay
 - `seismic_utils/predict.py` — load FBPUNet checkpoint + per-gather FB prediction
+- `models/` — local FBPUNet (cloned from hardpicks) used by `fbp_train.py`
 - `seismic_utils/export_npz.py` — per line-gather NPZ export
 - `seismic_utils/npz_parser.py` — fast hardpicks-compatible dataset from NPZ
 - `viewer.py` — Gradio UI (reference / prediction / both pick display)
@@ -102,13 +103,23 @@ CLI script (recommended) — TensorBoard + CSV logs, step/epoch progress with lo
 ```bash
 conda activate seismic_activity   # or Lightning Studio kernel after setup_lightning.sh
 python examples/local/fbp_train.py --sites Brunswick,Halfmile --backend npz --epochs 5
+python examples/local/fbp_train.py --list-models
+python examples/local/fbp_train.py --sites Brunswick --model efficientnet-b0 --epochs 5
 
 # watch metrics
-tensorboard --logdir output/train_brunswick_halfmile/tensorboard
+tensorboard --logdir output/train_brunswick_halfmile_resnet18/tensorboard
 ```
 
-Useful flags: `--batch-size`, `--num-workers`, `--npz-root`, `--output-dir`,
-`--print-every-n-steps` (stdout train loss), `--no-final-validate`.
+Useful flags: `--model` / `--model-config`, `--batch-size`, `--num-workers`, `--npz-root`,
+`--output-dir`, `--print-every-n-steps`, `--no-final-validate`.
+
+Model presets (`--model`): `resnet18` (default), `resnet34`, `resnet50`, `efficientnet-b0`,
+`efficientnet-b4`, `vanilla`, or any SMP encoder name. Full hyperparam overrides via
+`--model-config path.yaml` (merged on top of the preset). Resolved config is written to
+`output/.../model_config.yaml`.
+
+The trainer is the **local** `models.fbp.unet.FBPUNet` (cloned from hardpicks). Optional
+ImageNet (etc.) backbone init: `--encoder-weights imagenet`.
 
 Notebook equivalent:
 
