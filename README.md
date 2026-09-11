@@ -110,7 +110,8 @@ recipe is [`original_hardpicks.md`](original_hardpicks.md).
 
 CLI — TensorBoard + CSV logs, living report, best checkpoint on `valid/HitRate1px`.
 Defaults come from [`configs/train.yaml`](configs/train.yaml) (**20** epochs, **16**
-gathers per GPU, patience **4**). Override with `--config` or CLI flags.
+gathers per GPU, patience **4**, train augmentations). Override loop knobs with
+`--config` or CLI flags; edit `augmentations:` in the YAML (empty list = none).
 
 ```bash
 conda activate seismic_activity   # or Lightning Studio kernel after setup_lightning.sh
