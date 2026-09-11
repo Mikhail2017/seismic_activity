@@ -468,6 +468,7 @@ def write_report_md(
     lines = [
         f"# FBP validation — {meta.get('run_name', '')}",
         "",
+        f"- **Picker:** {meta.get('picker', 'fbpunet')}",
         f"- **Checkpoint:** `{meta.get('checkpoint', '')}`",
         f"- **Config:** `{meta.get('model_config', '')}`",
         f"- **Encoder:** {meta.get('encoder', '')}",

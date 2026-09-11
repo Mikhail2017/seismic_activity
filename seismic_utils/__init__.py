@@ -29,6 +29,12 @@ from .npz_parser import (
 )
 from .plotting import plot_shot_gather
 from .sites import SITE_CONFIGS, SiteConfig, resolve_site_config
+from .sta_lta import (
+    StaLtaOptions,
+    pick_first_breaks,
+    pick_first_breaks_ms,
+    pick_first_breaks_ms_from_shot_gather,
+)
 
 __all__ = [
     "DEFAULT_DATA_DIR",
@@ -53,7 +59,11 @@ __all__ = [
     "open_hardpicks_dataset",
     "open_trace_group",
     "plot_shot_gather",
+    "pick_first_breaks",
+    "pick_first_breaks_ms",
+    "pick_first_breaks_ms_from_shot_gather",
     "resolve_hardpicks_site_info",
     "resolve_npz_asset_dir",
     "resolve_site_config",
+    "StaLtaOptions",
 ]
