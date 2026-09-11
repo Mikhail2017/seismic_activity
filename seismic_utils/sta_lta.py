@@ -8,6 +8,7 @@ each trace independently and returns the first P-pick.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, replace
 from typing import Any, Mapping, Sequence
 
@@ -593,6 +594,59 @@ def pick_first_breaks(
     idx[live] = picks
     qual[live] = q
     return (idx, qual) if return_quality else idx
+
+
+def mp_worker_init() -> None:
+    """Pin BLAS/OpenMP to one thread so a process pool does not oversubscribe."""
+    for key in (
+        "OMP_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+    ):
+        os.environ[key] = "1"
+
+
+def score_eval_gather(payload: dict[str, Any]) -> dict[str, Any]:
+    """Pick one eval gather. Spawn-safe worker (this module does not import torch)."""
+    samples = np.asarray(payload["samples"], dtype=np.float64)
+    if samples.ndim != 2:
+        raise ValueError(f"samples must be 2D, got {samples.shape}")
+    n_tr = int(samples.shape[0])
+    dt_ms = float(payload["dt_ms"])
+    rec_ids = np.asarray(payload["rec_ids"]).reshape(-1)
+    if rec_ids.shape[0] != n_tr:
+        rec_ids = np.arange(n_tr, dtype=np.int64)
+    offsets = np.asarray(payload["offsets"], dtype=np.float64).reshape(-1)
+    if offsets.shape[0] != n_tr:
+        offsets = np.resize(offsets, n_tr)
+    target = np.asarray(payload["target"], dtype=np.float64).reshape(-1)
+    if target.shape[0] != n_tr:
+        target = np.resize(target, n_tr)
+
+    pred, qual = pick_first_breaks(
+        samples,
+        1000.0 / max(dt_ms, _EPS),
+        payload["opts"],
+        return_quality=True,
+    )
+    pred_int = np.zeros(n_tr, dtype=np.int64)
+    finite = np.isfinite(pred) & (pred > 0)
+    pred_int[finite] = np.rint(pred[finite]).astype(np.int64)
+    errors = np.where(target > 0, pred_int.astype(np.float64) - target, np.nan)
+    idx = np.flatnonzero(rec_ids != -1)
+    qual_arr = np.asarray(qual, dtype=np.float64).reshape(-1)
+    return {
+        "origin": payload["origin"],
+        "dt_ms": dt_ms,
+        "gather_id": int(payload["gather_id"]),
+        "shot_id": int(payload["shot_id"]),
+        "receiver_id": rec_ids[idx].astype(np.int64, copy=False),
+        "offset": offsets[idx],
+        "predictions": pred_int[idx],
+        "probabilities": qual_arr[idx],
+        "errors": errors[idx],
+    }
 
 
 def pick_first_breaks_ms(
