@@ -62,16 +62,9 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from seismic_utils.dataset import DEFAULT_DATA_DIR
-from seismic_utils.fb_smooth import DEFAULT_SMOOTH_THRESHOLD
 from seismic_utils.hardpicks_bridge import hardpicks_available, resolve_hardpicks_site_info
 from seismic_utils.hardpicks_pl_compat import ensure_hardpicks_lightning_compat
 from seismic_utils.npz_parser import create_npz_parser
-from seismic_utils.pickers import (
-    PICKER_BEFORE_AFTER,
-    attach_smooth_evaluators,
-    spec_for,
-    split_horizon_model,
-)
 from seismic_utils.predict import resolve_checkpoint
 
 logger = logging.getLogger("fbp_train")
@@ -111,6 +104,15 @@ MODEL_PRESETS: Dict[str, Dict[str, Any]] = {
         "mid_block_channels": 0,
         "decoder_block_channels": "[256, 128, 64, 32, 16]",
         "lr": 0.002136,
+    },
+    # Same backbone as resnet34, plus the linear-moveout first-break prior channel.
+    "resnet34-horizon": {
+        "unet_encoder_type": "resnet34",
+        "encoder_block_count": 5,
+        "mid_block_channels": 0,
+        "decoder_block_channels": "[256, 128, 64, 32, 16]",
+        "lr": 0.002136,
+        "use_first_break_prior": True,
     },
     "resnet50": {
         "unet_encoder_type": "resnet50",
@@ -420,9 +422,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--model",
         default="resnet18",
         help=(
-            "Architecture preset, or any SMP encoder id. "
-            "Append -horizon for a before/after first-break head "
-            f"(e.g. resnet34-horizon). Presets: {preset_names}."
+            "Architecture preset name, or any SMP encoder id "
+            f"(presets: {preset_names})."
         ),
     )
     p.add_argument(
@@ -474,15 +475,6 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         default=None,
         choices=("crossentropy", "dice"),
         help="Segmentation loss (default: crossentropy, or --model-config).",
-    )
-    p.add_argument(
-        "--smooth-threshold",
-        type=int,
-        default=None,
-        help=(
-            "Horizon-head pick smoother window in samples "
-            f"(default: {DEFAULT_SMOOTH_THRESHOLD}; used with --model *-horizon)."
-        ),
     )
     p.add_argument(
         "--ckpt",
@@ -651,23 +643,31 @@ def build_model_config(
     loss_type: Optional[str] = None,
     lr_step: Optional[int] = None,
     recipe: Optional[Dict[str, Any]] = None,
-    smooth_threshold: Optional[int] = None,
 ) -> tuple[Dict[str, Any], str]:
     """Build FBPUNet hyperparams from a preset and/or YAML/JSON override.
 
     Returns ``(hyper_params, model_label)`` where ``model_label`` is used in
     output paths and logs.
     """
-    encoder_name, picker = split_horizon_model(model)
-    model_label = resolve_model_name(encoder_name)
+    model_label = resolve_model_name(model)
+    use_prior = False
     if model_label in MODEL_PRESETS:
         arch = copy.deepcopy(MODEL_PRESETS[model_label])
+        use_prior = bool(arch.get("use_first_break_prior"))
     else:
-        # Treat as a raw encoder id (must be known to SMP at construct time).
-        arch = {"unet_encoder_type": model_label, **_decoder_for_encoder(model_label)}
+        encoder_key = model_label
+        # ``resnet18-horizon`` → encoder resnet18 + first-break prior channel.
+        if model_label.endswith("-horizon") and model_label != "-horizon":
+            encoder_key = model_label[: -len("-horizon")]
+            use_prior = True
+            if encoder_key in MODEL_ALIASES:
+                encoder_key = MODEL_ALIASES[encoder_key]
+        if encoder_key in MODEL_PRESETS:
+            arch = copy.deepcopy(MODEL_PRESETS[encoder_key])
+        else:
+            # Treat as a raw encoder id (must be known to SMP at construct time).
+            arch = {"unet_encoder_type": encoder_key, **_decoder_for_encoder(encoder_key)}
         model_label = model_label.replace("/", "-")
-    if picker == PICKER_BEFORE_AFTER:
-        model_label = f"{model_label}-horizon"
 
     file_overrides: Dict[str, Any] = {}
     if model_config_path is not None:
@@ -677,6 +677,7 @@ def build_model_config(
         if enc and model.strip().lower() in {"", "custom"}:
             model_label = str(enc)
 
+    arch.pop("use_first_break_prior", None)
     preset_lr = float(arch.pop("lr", 0.002136))
     recipe = dict(recipe or {})
     if recipe.get("lr") is not None:
@@ -731,6 +732,8 @@ def build_model_config(
         "max_epochs": max_epochs,
     }
     base.update(arch)
+    if use_prior:
+        base["use_first_break_prior"] = True
 
     # Merge file overrides (shallow + nested optimizer_params / scheduler_params).
     for key, value in file_overrides.items():
@@ -764,13 +767,8 @@ def build_model_config(
         sched = dict(base.get("scheduler_params") or {})
         sched["step_size"] = int(lr_step)
         base["scheduler_params"] = sched
-
-    picker_spec = spec_for(picker)
-    base["picker"] = picker_spec.name
-    base["segm_class_count"] = int(picker_spec.segm_class_count or 1)
-    base["segm_first_break_smooth_threshold"] = int(
-        smooth_threshold if smooth_threshold is not None else DEFAULT_SMOOTH_THRESHOLD
-    )
+    # Binary first-break vs not (ternary is not supported in this trainer).
+    base["segm_class_count"] = SEGMENTATION_CLASS_COUNT
 
     base["max_epochs"] = max_epochs
     base["model_type"] = base.get("model_type") or "FBPUNet"
@@ -785,9 +783,10 @@ def build_model_config(
 def list_models() -> None:
     print("Available --model presets (all train local models.fbp.unet.FBPUNet):\n")
     for name, cfg in sorted(MODEL_PRESETS.items()):
+        extra = "  +horizon-prior" if cfg.get("use_first_break_prior") else ""
         print(
             f"  {name:18s}  encoder={cfg['unet_encoder_type']}"
-            f"  decoder={cfg['decoder_block_channels']}  lr={cfg['lr']}"
+            f"  decoder={cfg['decoder_block_channels']}  lr={cfg['lr']}{extra}"
         )
     print("\nAliases:", ", ".join(f"{k}->{v}" for k, v in sorted(MODEL_ALIASES.items())))
     print(
@@ -795,7 +794,6 @@ def list_models() -> None:
         "(decoder channels are inferred)."
     )
     print("Pretrained backbones: --encoder-weights imagenet  (or ssl/swsl/… per encoder)")
-    print("Horizon head: append -horizon (e.g. resnet34-horizon) for before/after segmentation.")
     print("Override anything with --model-config path/to.yaml")
 
 
@@ -822,8 +820,11 @@ def _site_params(
     eval_ratio: Optional[float],
     use_eval_split: bool,
     augmentations: Optional[Sequence[Dict[str, Any]]] = None,
+    first_break_prior: bool = False,
 ) -> Dict[str, Any]:
     params: Dict[str, Any] = dict(COMMON_SITE_PARAMS)
+    if first_break_prior:
+        params["generate_first_break_prior_masks"] = True
     if augment:
         ops = (
             list(augmentations)
@@ -852,6 +853,7 @@ def build_split_parser(
     use_eval_split: bool,
     segm_class_count: int = SEGMENTATION_CLASS_COUNT,
     augmentations: Optional[Sequence[Dict[str, Any]]] = None,
+    first_break_prior: bool = False,
 ):
     """Build a concatenated parser for one split (train or valid)."""
     import hardpicks
@@ -875,6 +877,7 @@ def build_split_parser(
                         eval_ratio=eval_ratio,
                         use_eval_split=use_eval_split,
                         augmentations=augmentations,
+                        first_break_prior=first_break_prior,
                     ),
                     segm_class_count=segm_class_count,
                 )
@@ -910,6 +913,7 @@ def build_split_parser(
                             eval_ratio=eval_ratio,
                             use_eval_split=use_eval_split,
                             augmentations=augmentations,
+                            first_break_prior=first_break_prior,
                         ),
                     },
                     prefix=prefix,
@@ -934,6 +938,7 @@ def build_parsers(
     eval_ratio: Optional[float],
     segm_class_count: int = SEGMENTATION_CLASS_COUNT,
     augmentations: Optional[Sequence[Dict[str, Any]]] = None,
+    first_break_prior: bool = False,
 ):
     train_parser = build_split_parser(
         train_site_names,
@@ -946,6 +951,7 @@ def build_parsers(
         use_eval_split=False,
         segm_class_count=segm_class_count,
         augmentations=augmentations,
+        first_break_prior=first_break_prior,
     )
     valid_parser = build_split_parser(
         valid_site_names,
@@ -957,6 +963,7 @@ def build_parsers(
         augment=False,
         use_eval_split=True,
         segm_class_count=segm_class_count,
+        first_break_prior=first_break_prior,
     )
     logger.info(
         "Total train gathers: %d | Valid gathers: %d",
@@ -1758,7 +1765,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         loss_type=args.loss,
         lr_step=args.lr_step,
         recipe=getattr(args, "train_recipe", None),
-        smooth_threshold=args.smooth_threshold,
     )
     model_slug = "".join(c if c.isalnum() or c in "-_" else "-" for c in model_label.lower())
 
@@ -1788,9 +1794,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "run_name": run_name,
                 "model": model_label,
                 "encoder": model_config.get("unet_encoder_type"),
-                "picker": model_config.get("picker"),
-                "segm_class_count": model_config.get("segm_class_count"),
-                "smooth_threshold": model_config.get("segm_first_break_smooth_threshold"),
                 "fold": site_label if eval_ratio is None else None,
                 "train_sites": list(train_site_names),
                 "valid_sites": list(valid_site_names),
@@ -1825,13 +1828,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     else:
         print("Sites:", train_site_names, f"| eval_ratio={eval_ratio}")
     print("Model:", model_label, "| encoder:", model_config.get("unet_encoder_type"))
-    print(
-        "picker:",
-        model_config.get("picker"),
-        "| segm_class_count:",
-        model_config.get("segm_class_count"),
-    )
     print("encoder_weights:", model_config.get("encoder_weights"))
+    print("first_break_prior:", bool(model_config.get("use_first_break_prior")))
     print(
         "loss:",
         model_config.get("loss_type"),
@@ -1907,8 +1905,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         data_dir=args.data_dir,
         npz_root=npz_root,
         eval_ratio=eval_ratio,
-        segm_class_count=int(model_config.get("segm_class_count") or SEGMENTATION_CLASS_COUNT),
+        segm_class_count=SEGMENTATION_CLASS_COUNT,
         augmentations=getattr(args, "train_augmentations", None),
+        first_break_prior=bool(model_config.get("use_first_break_prior")),
     )
     train_loader, valid_loader = build_loaders(
         train_parser,
@@ -1931,8 +1930,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         report._write_markdown()
 
     model = fbp_unet.FBPUNet(model_config)
-    if str(model_config.get("picker") or "") == PICKER_BEFORE_AFTER:
-        attach_smooth_evaluators(model, model_config)
     setattr(model, "_tbx_logger", tbx_logger)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"FBPUNet[{model_label}] ready: {n_params / 1e6:.2f}M trainable parameters")
