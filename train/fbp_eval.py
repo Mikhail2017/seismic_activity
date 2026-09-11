@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Validate an FBPUNet checkpoint and write a rich prediction report.
+"""Validate first-break picks and write a rich prediction report.
 
-Loads ``best*.ckpt`` + ``model_config.yaml`` (or a Lightning checkpoint that
-embeds hyperparams), runs the fold/site validation set, and writes:
+Default is an FBPUNet checkpoint. Pass ``--picker sta-lta`` to score the
+Jones & van der Baan adaptive STA-LTA (no checkpoint).
 
     report/eval_<label>_<YYYYMMDD_HHMMSS>/
       report.md  index.html  stats.html  worst.html  typical.html
@@ -15,6 +15,7 @@ Example::
         --fold A --backend hdf5 --data-dir /tmp/data/
     python train/fbp_eval.py --ckpt output/train_foldA_resnet34/best-epoch=013-step=015232.ckpt \\
         --fold A --backend npz
+    python train/fbp_eval.py --picker sta-lta --fold A --backend hdf5
 """
 
 from __future__ import annotations
@@ -76,8 +77,14 @@ EVAL_METRICS: List[Dict[str, Any]] = [
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Validate an FBPUNet checkpoint and write a prediction report.",
+        description="Validate FBPUNet or STA-LTA-OS first-break picks and write a prediction report.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    p.add_argument(
+        "--picker",
+        choices=("fbpunet", "sta-lta"),
+        default="fbpunet",
+        help="fbpunet needs --ckpt/--ckpt-dir; sta-lta is Jones & van der Baan adaptive STA-LTA.",
     )
     p.add_argument("--ckpt", type=Path, default=None, help="Path to a .ckpt file.")
     p.add_argument(
@@ -112,11 +119,24 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--n-worst", type=int, default=8, help="Worst gathers to plot.")
     p.add_argument("--n-typical", type=int, default=4, help="Typical/good gathers to plot.")
     p.add_argument("--report-dir", type=Path, default=None, help="Report root (default: <repo>/report).")
+    p.add_argument("--sta-lta-th", type=float, default=1.3, help="STA-LTA-OS detection threshold Th.")
+    p.add_argument(
+        "--sta-lta-lw",
+        type=float,
+        default=0.5,
+        help="STA-LTA-OS long-window length in seconds (paper 0.50 s). First-break EM uses the full trace; this still caps the short window.",
+    )
+    p.add_argument(
+        "--sta-lta-sw",
+        type=float,
+        default=0.05,
+        help="STA-LTA-OS short window in seconds (paper: 0.05 s at 4 kHz).",
+    )
     p.add_argument("-v", "--verbose", action="store_true")
     p.add_argument("--list-folds", action="store_true")
     args = p.parse_args(argv)
-    if not args.list_folds and args.ckpt is None and args.ckpt_dir is None:
-        p.error("Provide --ckpt or --ckpt-dir")
+    if not args.list_folds and args.picker == "fbpunet" and args.ckpt is None and args.ckpt_dir is None:
+        p.error("Provide --ckpt or --ckpt-dir (or use --picker sta-lta)")
     return args
 
 
@@ -294,6 +314,99 @@ def run_eval(model, loader, device: torch.device, evaluator) -> tuple[pd.DataFra
     return evaluator._dataframe.copy(), summary, mean_loss
 
 
+def _sta_lta_options_from_args(args: argparse.Namespace):
+    from seismic_utils.sta_lta import StaLtaOptions
+
+    return StaLtaOptions(th=float(args.sta_lta_th), lw_s=float(args.sta_lta_lw), sw_s=float(args.sta_lta_sw))
+
+
+def run_sta_lta_eval(parser, opts) -> tuple[pd.DataFrame, Dict[str, int], Dict[str, float]]:
+    """Score STA-LTA-OS picks on every gather in *parser* (no neural net)."""
+    from seismic_utils.sta_lta import pick_first_breaks
+
+    try:
+        from tqdm import tqdm
+    except ImportError:
+        tqdm = lambda x, **k: x  # noqa: E731
+
+    origin_id_map: Dict[str, int] = {}
+    dt_by_origin: Dict[str, float] = {}
+    chunks: List[pd.DataFrame] = []
+
+    for i in tqdm(range(len(parser)), desc="sta-lta"):
+        item = parser[i]
+        origin = str(item.get("origin") or item.get("site_name") or "unknown")
+        if origin not in origin_id_map:
+            origin_id_map[origin] = len(origin_id_map)
+        dt_ms = sample_rate_ms_from_item(item)
+        dt_by_origin.setdefault(origin, dt_ms)
+
+        samples = np.asarray(item["samples"], dtype=np.float64)
+        if samples.ndim != 2:
+            raise ValueError(f"gather {i}: samples must be 2D, got {samples.shape}")
+        n_tr = int(samples.shape[0])
+        rec_ids = np.asarray(item["rec_ids"]).reshape(-1)
+        if rec_ids.shape[0] != n_tr:
+            rec_ids = np.arange(n_tr, dtype=np.int64)
+        good = rec_ids != -1
+        offsets_raw = item.get("offset_distances")
+        if offsets_raw is not None:
+            offsets = np.asarray(offsets_raw, dtype=np.float64).reshape(n_tr, -1)[:, 0]
+        else:
+            offsets = np.full(n_tr, np.nan, dtype=np.float64)
+        target = np.asarray(item["first_break_labels"], dtype=np.float64).reshape(-1)
+        if target.shape[0] != n_tr:
+            target = np.resize(target, n_tr)
+
+        pred, qual = pick_first_breaks(
+            samples,
+            1000.0 / max(dt_ms, 1e-12),
+            opts,
+            return_quality=True,
+        )
+        pred_int = np.zeros(n_tr, dtype=np.int64)
+        finite = np.isfinite(pred) & (pred > 0)
+        pred_int[finite] = np.rint(pred[finite]).astype(np.int64)
+        valid_tgt = target > 0
+        errors = np.where(valid_tgt, pred_int.astype(np.float64) - target, np.nan)
+
+        idx = np.flatnonzero(good)
+        if idx.size == 0:
+            continue
+        chunks.append(
+            pd.DataFrame(
+                {
+                    "GatherId": np.full(idx.size, int(item["gather_id"]), dtype=np.int64),
+                    "ShotId": np.full(idx.size, int(item["shot_id"]), dtype=np.int64),
+                    "ReceiverId": rec_ids[idx].astype(np.int64, copy=False),
+                    "OriginId": np.full(idx.size, origin_id_map[origin], dtype=np.int64),
+                    "Offset": offsets[idx],
+                    "Predictions": pred_int[idx],
+                    "Probabilities": qual[idx],
+                    "GatherCoverage": pred_int[idx] > 0,
+                    "ExpectedCoverage": np.ones(idx.size, dtype=bool),
+                    "Errors": errors[idx],
+                }
+            )
+        )
+
+    traces = pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame(
+        {
+            "GatherId": pd.Series(dtype="int"),
+            "ShotId": pd.Series(dtype="int"),
+            "ReceiverId": pd.Series(dtype="int"),
+            "OriginId": pd.Series(dtype="int"),
+            "Offset": pd.Series(dtype="float"),
+            "Predictions": pd.Series(dtype="int"),
+            "Probabilities": pd.Series(dtype="float"),
+            "GatherCoverage": pd.Series(dtype="bool"),
+            "ExpectedCoverage": pd.Series(dtype="bool"),
+            "Errors": pd.Series(dtype="float"),
+        }
+    )
+    return traces, origin_id_map, dt_by_origin
+
+
 def plot_gallery(
     rows: pd.DataFrame,
     *,
@@ -364,43 +477,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    print("PL compat:", ensure_hardpicks_lightning_compat())
+    if args.picker == "fbpunet":
+        print("PL compat:", ensure_hardpicks_lightning_compat())
     if not hardpicks_available():
         raise SystemExit("hardpicks (+ torch) required — run setup_lightning.sh / install requirements")
 
-    try:
-        ckpt = resolve_checkpoint(args.ckpt, ckpt_dir=args.ckpt_dir)
-    except FileNotFoundError as exc:
-        raise SystemExit(str(exc)) from exc
-    config_path = find_model_config(ckpt, args.ckpt_dir, args.model_config)
-    file_cfg: Dict[str, Any] = {}
-    if config_path is not None:
-        loaded = yaml.safe_load(config_path.read_text()) or {}
-        if isinstance(loaded, dict):
-            file_cfg = loaded
-
     site_label, site_names, eval_ratio = resolve_eval_sites(args)
     npz_root = args.npz_root or (args.data_dir / "npz")
-
-    import hardpicks.metrics.fbp.evaluator as fbp_eval
-    import hardpicks.data.fbp.data_module as fbp_data_module
-    import torch.utils.data
-
-    model = load_fbp_model(ckpt)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = model.to(device)
-    model.images_to_display = 0
-    hp = dict(getattr(model, "hparams", {}) or {})
-    if file_cfg:
-        hp = {**file_cfg, **hp}
-    hp["eval_metrics"] = merge_eval_metrics(hp.get("eval_metrics"))
-    hp["segm_class_count"] = hp.get("segm_class_count") or getattr(model, "segm_class_count", 1)
-    hp["segm_first_break_prob_threshold"] = hp.get(
-        "segm_first_break_prob_threshold",
-        getattr(model, "segm_first_break_prob_threshold", 0.0),
-    )
-    evaluator = fbp_eval.FBPEvaluator(hp)
-
     parser = train_cli.build_split_parser(
         site_names,
         prefix="valid",
@@ -411,49 +494,100 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         augment=False,
         use_eval_split=bool(eval_ratio),
     )
-    collate_fn = functools.partial(
-        fbp_data_module.fbp_batch_collate,
-        pad_to_nearest_pow2=True,
-    )
-    worker_kwargs: Dict[str, Any] = {}
-    if args.num_workers > 0:
-        worker_kwargs["persistent_workers"] = True
-        worker_kwargs["prefetch_factor"] = 2
-    loader = torch.utils.data.DataLoader(
-        parser,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        collate_fn=collate_fn,
-        pin_memory=device.type == "cuda",
-        **worker_kwargs,
-    )
-    print(
-        f"Checkpoint: {ckpt}\n"
-        f"Config: {config_path}\n"
-        f"Eval sites: {site_names}  gathers={len(parser)}  batches={len(loader)}\n"
-        f"Device: {device}"
-    )
 
-    traces_raw, evaluator_summary, mean_loss = run_eval(model, loader, device, evaluator)
-    dt_by_origin = collect_sample_rates(parser, site_names)
-    traces = annotate_trace_frame(
-        traces_raw,
-        origin_id_map=evaluator.origin_id_map,
-        sample_rate_ms_by_origin=dt_by_origin,
-    )
-    metrics = headline_metrics(traces)
-    metrics["loss"] = mean_loss
-    metrics["evaluator"] = {
-        str(k): (float(v) if np.isfinite(float(v)) else None) for k, v in evaluator_summary.items()
-    }
+    ckpt: Optional[Path] = None
+    config_path: Optional[Path] = None
+    encoder = "sta-lta" if args.picker == "sta-lta" else "model"
+
+    if args.picker == "sta-lta":
+        sta_opts = _sta_lta_options_from_args(args)
+        print(
+            f"Picker: STA-LTA-OS (Th={sta_opts.th}, Lw={sta_opts.lw_s}s, Sw={sta_opts.sw_s}s)\n"
+            f"Eval sites: {site_names}  gathers={len(parser)}"
+        )
+        traces_raw, origin_id_map, dt_by_origin = run_sta_lta_eval(parser, sta_opts)
+        traces = annotate_trace_frame(
+            traces_raw,
+            origin_id_map=origin_id_map,
+            sample_rate_ms_by_origin=dt_by_origin,
+        )
+        metrics = headline_metrics(traces)
+        metrics["loss"] = None
+        metrics["picker"] = "sta-lta"
+        metrics["sta_lta"] = {"th": sta_opts.th, "lw_s": sta_opts.lw_s, "sw_s": sta_opts.sw_s}
+    else:
+        import hardpicks.metrics.fbp.evaluator as fbp_eval
+        import hardpicks.data.fbp.data_module as fbp_data_module
+        import torch.utils.data
+
+        try:
+            ckpt = resolve_checkpoint(args.ckpt, ckpt_dir=args.ckpt_dir)
+        except FileNotFoundError as exc:
+            raise SystemExit(str(exc)) from exc
+        config_path = find_model_config(ckpt, args.ckpt_dir, args.model_config)
+        file_cfg: Dict[str, Any] = {}
+        if config_path is not None:
+            loaded = yaml.safe_load(config_path.read_text()) or {}
+            if isinstance(loaded, dict):
+                file_cfg = loaded
+
+        model = load_fbp_model(ckpt)
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model = model.to(device)
+        model.images_to_display = 0
+        hp = dict(getattr(model, "hparams", {}) or {})
+        if file_cfg:
+            hp = {**file_cfg, **hp}
+        hp["eval_metrics"] = merge_eval_metrics(hp.get("eval_metrics"))
+        hp["segm_class_count"] = hp.get("segm_class_count") or getattr(model, "segm_class_count", 1)
+        hp["segm_first_break_prob_threshold"] = hp.get(
+            "segm_first_break_prob_threshold",
+            getattr(model, "segm_first_break_prob_threshold", 0.0),
+        )
+        evaluator = fbp_eval.FBPEvaluator(hp)
+        collate_fn = functools.partial(
+            fbp_data_module.fbp_batch_collate,
+            pad_to_nearest_pow2=True,
+        )
+        worker_kwargs: Dict[str, Any] = {}
+        if args.num_workers > 0:
+            worker_kwargs["persistent_workers"] = True
+            worker_kwargs["prefetch_factor"] = 2
+        loader = torch.utils.data.DataLoader(
+            parser,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            collate_fn=collate_fn,
+            pin_memory=device.type == "cuda",
+            **worker_kwargs,
+        )
+        print(
+            f"Checkpoint: {ckpt}\n"
+            f"Config: {config_path}\n"
+            f"Eval sites: {site_names}  gathers={len(parser)}  batches={len(loader)}\n"
+            f"Device: {device}"
+        )
+        traces_raw, evaluator_summary, mean_loss = run_eval(model, loader, device, evaluator)
+        dt_by_origin = collect_sample_rates(parser, site_names)
+        traces = annotate_trace_frame(
+            traces_raw,
+            origin_id_map=evaluator.origin_id_map,
+            sample_rate_ms_by_origin=dt_by_origin,
+        )
+        metrics = headline_metrics(traces)
+        metrics["loss"] = mean_loss
+        metrics["picker"] = "fbpunet"
+        metrics["evaluator"] = {
+            str(k): (float(v) if np.isfinite(float(v)) else None) for k, v in evaluator_summary.items()
+        }
+        encoder = hp.get("unet_encoder_type") or "model"
     offset_df = offset_bin_table(traces)
     gather_df = gather_summary(traces)
     worst_df, typical_df = pick_gallery_gathers(
         gather_df, n_worst=args.n_worst, n_typical=args.n_typical
     )
 
-    encoder = hp.get("unet_encoder_type") or "model"
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_name = f"eval_{site_label}_{str(encoder).replace('/', '-')}"
     report_root = (args.report_dir or (REPO_ROOT / "report")).resolve()
@@ -494,7 +628,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     write_worst_html(typical_cards, report_dir / "typical.html", title="Typical gathers")
     meta = {
         "run_name": run_name,
-        "checkpoint": str(ckpt),
+        "picker": args.picker,
+        "checkpoint": str(ckpt) if ckpt is not None else "—",
         "model_config": str(config_path) if config_path else "",
         "encoder": encoder,
         "sites": list(site_names),

@@ -104,11 +104,35 @@ def _parse_gather_id(choice: str) -> int:
     return int(choice.split(":", 1)[0].strip())
 
 
+PICKER_MODES = ("fbpunet", "sta-lta")
+
+
 def _normalize_pick_display(pick_display: str) -> str:
     mode = (pick_display or "reference").strip().lower()
     if mode not in {"reference", "prediction", "both"}:
         raise gr.Error(f"Unknown pick display mode: {pick_display!r}")
     return mode
+
+
+def _normalize_picker(picker: str) -> str:
+    mode = (picker or "fbpunet").strip().lower().replace("_", "-")
+    if mode in {"unet", "model", "ckpt", "checkpoint"}:
+        mode = "fbpunet"
+    if mode in {"stalta", "sta/lta", "sta-lta-os"}:
+        mode = "sta-lta"
+    if mode not in PICKER_MODES:
+        raise gr.Error(f"Unknown picker: {picker!r}")
+    return mode
+
+
+def _sta_lta_options_from_ui(th: float | None, lw_s: float | None, sw_s: float | None):
+    from seismic_utils.sta_lta import StaLtaOptions
+
+    return StaLtaOptions(
+        th=float(th) if th is not None else 1.3,
+        lw_s=float(lw_s) if lw_s is not None else 0.5,
+        sw_s=float(sw_s) if sw_s is not None else 0.05,
+    )
 
 
 def load_model(ckpt_path: str):
@@ -156,7 +180,21 @@ def _predict_for_gather(
     store: HardpicksGatherStore | None,
     ref: LineGatherRef,
     gather: ShotGather | None = None,
+    *,
+    picker: str = "fbpunet",
+    sta_lta_opts=None,
 ) -> np.ndarray:
+    picker = _normalize_picker(picker)
+    if picker == "sta-lta":
+        from seismic_utils.sta_lta import pick_first_breaks_ms_from_shot_gather
+
+        if gather is None:
+            raise gr.Error("STA-LTA picking needs a loaded gather.")
+        try:
+            return pick_first_breaks_ms_from_shot_gather(gather, sta_lta_opts)
+        except Exception as exc:  # noqa: BLE001
+            raise gr.Error(f"STA-LTA pick failed: {exc}") from exc
+
     from seismic_utils.predict import (
         predict_first_breaks_ms,
         predict_first_breaks_ms_from_shot_gather,
@@ -184,6 +222,10 @@ def load_dataset(
     show_first_breaks: bool,
     highlight_regions: bool,
     pick_display: str = "reference",
+    picker: str = "fbpunet",
+    sta_lta_th: float | None = 1.3,
+    sta_lta_lw: float | None = 0.5,
+    sta_lta_sw: float | None = 0.05,
     force_reload: bool = False,
 ):
     path = Path(file_path).expanduser()
@@ -211,10 +253,17 @@ def load_dataset(
         show_first_breaks=show_first_breaks,
         highlight_regions=highlight_regions,
         pick_display=pick_display,
+        picker=picker,
+        sta_lta_th=sta_lta_th,
+        sta_lta_lw=sta_lta_lw,
+        sta_lta_sw=sta_lta_sw,
     )
     backend = "hardpicks" if _prefer_hardpicks_loads() and store is not None else "native"
     model_note = ""
-    if _MODEL_CACHE["path"]:
+    picker_mode = _normalize_picker(picker)
+    if picker_mode == "sta-lta":
+        model_note = " | picker=STA-LTA-OS"
+    elif _MODEL_CACHE["path"]:
         model_note = f" | model={Path(_MODEL_CACHE['path']).name}"
     cache_note = "cache hit" if was_cached else "indexed"
     status = (
@@ -236,6 +285,10 @@ def plot_selected(
     show_first_breaks: bool = True,
     highlight_regions: bool = False,
     pick_display: str = "reference",
+    picker: str = "fbpunet",
+    sta_lta_th: float | None = 1.3,
+    sta_lta_lw: float | None = 0.5,
+    sta_lta_sw: float | None = 0.05,
 ):
     if not file_path or not gather_choice:
         raise gr.Error("Select a dataset file and a line gather.")
@@ -245,6 +298,7 @@ def plot_selected(
         raise gr.Error(f"File not found: {path}")
 
     mode = _normalize_pick_display(pick_display)
+    picker_mode = _normalize_picker(picker)
     site, index, store = _get_index(path)
     gather_id = _parse_gather_id(gather_choice)
     if gather_id < 0 or gather_id >= len(index):
@@ -259,7 +313,13 @@ def plot_selected(
 
     pred_ms = None
     if mode in {"prediction", "both"}:
-        pred_ms = _predict_for_gather(store, ref, gather=gather)
+        pred_ms = _predict_for_gather(
+            store,
+            ref,
+            gather=gather,
+            picker=picker_mode,
+            sta_lta_opts=_sta_lta_options_from_ui(sta_lta_th, sta_lta_lw, sta_lta_sw),
+        )
 
     return plot_shot_gather(
         gather,
@@ -277,8 +337,9 @@ def build_app() -> gr.Blocks:
             "2D images are **shot × receiver-line** gathers. "
             "Browsing uses the **native** index/loader by default (fast). "
             "Set `SEISMIC_BACKEND=hardpicks` for official hardpicks loads (slower open).\n\n"
-            "**Prediction mode:** load a training `best*.ckpt`, then switch picks between "
-            "reference labels, model predictions (lime), or both. Predictions run on the "
+            "**Prediction mode:** choose **FBPUNet** (load a training `best*.ckpt`) or **STA-LTA-OS** "
+            "(Jones & van der Baan adaptive picker, no checkpoint). Then switch picks between "
+            "reference labels, predictions (lime), or both. Neural-net predictions run on the "
             "already-loaded gather (no full hardpicks HDF5 open)."
         )
 
@@ -303,7 +364,13 @@ def build_app() -> gr.Blocks:
                 label="Pick display",
                 choices=["reference", "prediction", "both"],
                 value="reference",
-                info="Prediction/both need a loaded checkpoint.",
+                info="Prediction/both: load a checkpoint (FBPUNet) or use the STA-LTA picker.",
+            )
+            picker = gr.Radio(
+                label="Picker",
+                choices=["fbpunet", "sta-lta"],
+                value="fbpunet",
+                info="sta-lta is Jones & van der Baan adaptive STA-LTA (no checkpoint).",
             )
 
         with gr.Accordion("Prediction model", open=False):
@@ -316,13 +383,46 @@ def build_app() -> gr.Blocks:
                 load_model_btn = gr.Button("Load model", scale=1)
             model_status = gr.Textbox(label="Model status", interactive=False)
 
+        with gr.Accordion("STA-LTA-OS", open=False):
+            gr.Markdown(
+                "Adaptive STA-LTA with outlier statistics (Jones & van der Baan, 2015). "
+                "First-break mode fits a two-state HMM on the **full gather**, then picks the "
+                "first onset with a short-window STA of outlier probability. "
+                "**Th** and **short window** control the pick; the long window is the paper’s "
+                "EM analysis length and is used to size the short window."
+            )
+            with gr.Row():
+                sta_lta_th = gr.Number(label="Threshold Th", value=1.3, minimum=0.1, maximum=5.0, step=0.1)
+                sta_lta_lw = gr.Number(label="Long window (s)", value=0.5, minimum=0.05, maximum=2.0, step=0.05)
+                sta_lta_sw = gr.Number(label="Short window (s)", value=0.05, minimum=0.004, maximum=0.5, step=0.005)
+
         plot = gr.Plot(label="Line gather")
 
-        plot_inputs = [file_path, gather_dropdown, show_fb, highlight_regions, pick_display]
+        plot_inputs = [
+            file_path,
+            gather_dropdown,
+            show_fb,
+            highlight_regions,
+            pick_display,
+            picker,
+            sta_lta_th,
+            sta_lta_lw,
+            sta_lta_sw,
+        ]
+        load_inputs = [
+            file_path,
+            show_fb,
+            highlight_regions,
+            pick_display,
+            picker,
+            sta_lta_th,
+            sta_lta_lw,
+            sta_lta_sw,
+        ]
 
         load_btn.click(
             fn=load_dataset,
-            inputs=[file_path, show_fb, highlight_regions, pick_display],
+            inputs=load_inputs,
             outputs=[file_path, gather_dropdown, plot, status],
         )
         load_model_btn.click(
@@ -338,6 +438,10 @@ def build_app() -> gr.Blocks:
         show_fb.change(fn=plot_selected, inputs=plot_inputs, outputs=[plot])
         highlight_regions.change(fn=plot_selected, inputs=plot_inputs, outputs=[plot])
         pick_display.change(fn=plot_selected, inputs=plot_inputs, outputs=[plot])
+        picker.change(fn=plot_selected, inputs=plot_inputs, outputs=[plot])
+        sta_lta_th.change(fn=plot_selected, inputs=plot_inputs, outputs=[plot])
+        sta_lta_lw.change(fn=plot_selected, inputs=plot_inputs, outputs=[plot])
+        sta_lta_sw.change(fn=plot_selected, inputs=plot_inputs, outputs=[plot])
 
     return demo
 
