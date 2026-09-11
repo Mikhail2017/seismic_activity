@@ -1337,6 +1337,17 @@ class TrainingReport:
         )
         if self.final_valid:
             lines.extend(["## Final validation (best checkpoint)", ""])
+            final_hit = self.final_valid.get(MONITOR_METRIC)
+            if (
+                self.best_score is not None
+                and final_hit is not None
+                and abs(float(final_hit) - float(self.best_score)) > 0.01
+            ):
+                lines.append(
+                    f"_Warning: this `{MONITOR_METRIC}` differs from the in-training "
+                    f"checkpoint score above. Model selection used the intermediate table._"
+                )
+                lines.append("")
             for key, value in sorted(self.final_valid.items()):
                 lines.append(f"- `{key}`: {_fmt_metric(value)}")
             lines.append("")
@@ -1398,6 +1409,9 @@ class ProgressMetricsCallback(pl.Callback):
             return
         if getattr(trainer, "global_rank", 0) != 0:
             return
+        if self.report is None:
+            # Post-fit validate: main() prints the best-checkpoint summary.
+            return
         metrics = trainer.callback_metrics
         keys = sorted(
             k
@@ -1413,20 +1427,19 @@ class ProgressMetricsCallback(pl.Callback):
         for key in keys:
             print(f"  {key:32s} {_fmt_metric(metrics[key])}", flush=True)
         print("-" * 72, flush=True)
-        if self.report is not None:
-            best_path = None
-            best_score = None
-            if self.checkpoint_cb is not None:
-                if self.checkpoint_cb.best_model_path:
-                    best_path = Path(self.checkpoint_cb.best_model_path)
-                best_score = self.checkpoint_cb.best_model_score
-            self.report.log_validation(
-                step=int(trainer.global_step),
-                epoch=int(trainer.current_epoch),
-                metrics=_snapshot_metrics(trainer),
-                best_checkpoint=best_path,
-                best_score=best_score,
-            )
+        best_path = None
+        best_score = None
+        if self.checkpoint_cb is not None:
+            if self.checkpoint_cb.best_model_path:
+                best_path = Path(self.checkpoint_cb.best_model_path)
+            best_score = self.checkpoint_cb.best_model_score
+        self.report.log_validation(
+            step=int(trainer.global_step),
+            epoch=int(trainer.current_epoch),
+            metrics=_snapshot_metrics(trainer),
+            best_checkpoint=best_path,
+            best_score=best_score,
+        )
 
 
 def _find_metrics_csv(csv_root: Path) -> Path:
@@ -1699,6 +1712,44 @@ def _load_fbpunet_from_checkpoint(ckpt_path: Path):
         return _load_model()
     finally:
         mlflow.log_param = orig
+
+
+def make_model_checkpoint(dirpath: Path | str) -> pl.callbacks.ModelCheckpoint:
+    """Save the top ``valid/HitRate1px`` checkpoint, overwriting same-name leftovers.
+
+    ``enable_version_counter=False`` avoids ``best-epoch=…-v1.ckpt`` when the
+    output dir still has a previous run's file with the same epoch/step name.
+    """
+    kwargs: Dict[str, Any] = dict(
+        dirpath=str(dirpath),
+        filename="best-{epoch:03d}-{step:06d}",
+        monitor=MONITOR_METRIC,
+        mode="max",
+        save_top_k=1,
+    )
+    try:
+        return pl.callbacks.ModelCheckpoint(**kwargs, enable_version_counter=False)
+    except TypeError:
+        return pl.callbacks.ModelCheckpoint(**kwargs)
+
+
+def validate_best_checkpoint(trainer: pl.Trainer, valid_loader, best_path: Path):
+    """Re-run validation with best-checkpoint *weights* on the fitted module.
+
+    Do not construct a new ``FBPUNet`` and pass it into a trainer that already
+    ran ``fit()``. Lightning 2.x then mixes loop / BatchNorm / evaluator state,
+    and the report's "Final validation" no longer matches the in-training score
+    that ``ModelCheckpoint`` used to pick the file.
+    """
+    module = trainer.lightning_module
+    if module is None:
+        raise RuntimeError("validate_best_checkpoint requires a fitted trainer.lightning_module")
+    ckpt_path = str(Path(best_path))
+    try:
+        return trainer.validate(module, dataloaders=valid_loader, ckpt_path=ckpt_path)
+    except TypeError:
+        return trainer.validate(module, val_dataloaders=valid_loader, ckpt_path=ckpt_path)
+
 
 def make_trainer(
     *,
@@ -2015,13 +2066,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"FBPUNet[{model_label}] ready: {n_params / 1e6:.2f}M trainable parameters")
 
-    checkpoint_cb = pl.callbacks.ModelCheckpoint(
-        dirpath=str(output_root),
-        filename="best-{epoch:03d}-{step:06d}",
-        monitor=MONITOR_METRIC,
-        mode="max",
-        save_top_k=1,
-    )
+    checkpoint_cb = make_model_checkpoint(output_root)
     progress_cb = ProgressMetricsCallback(
         print_every_n_steps=args.print_every_n_steps,
         report=report,
@@ -2097,18 +2142,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     extra_valid: Optional[Dict[str, Any]] = None
     progress_cb.report = None  # don't treat post-fit validate() as another training epoch
     if not args.no_final_validate and best_path and best_path.is_file():
-        best_model = _load_fbpunet_from_checkpoint(best_path)
-        setattr(best_model, "_tbx_logger", tbx_logger)
-        try:
-            val_out = trainer.validate(best_model, dataloaders=valid_loader)
-        except TypeError:
-            val_out = trainer.validate(best_model, val_dataloaders=valid_loader)
+        val_out = validate_best_checkpoint(trainer, valid_loader, best_path)
         if is_zero:
             print("\nValidation with best checkpoint:")
             if isinstance(val_out, list) and val_out:
                 extra_valid = dict(val_out[0])
                 for k, v in sorted(extra_valid.items()):
                     print(f"  {k:30s} {v}")
+                best_hit = _metric_float(checkpoint_cb.best_model_score)
+                final_hit = _metric_float(extra_valid.get(MONITOR_METRIC))
+                if (
+                    best_hit is not None
+                    and final_hit is not None
+                    and abs(final_hit - best_hit) > 0.01
+                ):
+                    print(
+                        f"WARNING: final {MONITOR_METRIC}={final_hit:.6f} differs from "
+                        f"in-training checkpoint score {best_hit:.6f}. "
+                        "Model selection used the intermediate validation table.",
+                        flush=True,
+                    )
     elif is_zero:
         if args.no_final_validate:
             print("Skipped final validate (--no-final-validate).")
