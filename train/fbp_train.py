@@ -1517,6 +1517,36 @@ def resolve_strategy(
             return "ddp_find_unused_parameters_true" if key == "ddp" else key
     return key
 
+def _load_fbpunet_from_checkpoint(ckpt_path: Path):
+    """Reload a Lightning checkpoint without colliding with the parent MLflow run.
+
+    ``hardpicks.utils.hp_utils.log_hp`` always calls ``mlflow.log_param``. Reconstructing
+    a model from a checkpoint whose saved hparams differ from this run (e.g. resume a
+    ``crossentropy`` ckpt then train with ``--loss dice``) raises
+    ``UNIQUE constraint failed: params.key`` / ``Changing param values is not allowed``.
+    """
+    import models.fbp.unet as fbp_unet
+
+    try:
+        import mlflow
+        from mlflow.exceptions import MlflowException
+    except ImportError:
+        return fbp_unet.FBPUNet.load_from_checkpoint(str(ckpt_path))
+
+    orig = mlflow.log_param
+
+    def _log_param_keep_existing(key, value, *args, **kwargs):
+        try:
+            return orig(key, value, *args, **kwargs)
+        except MlflowException:
+            logger.debug("mlflow: skip param overwrite %s=%r", key, value)
+            return value
+
+    mlflow.log_param = _log_param_keep_existing  # type: ignore[method-assign]
+    try:
+        return fbp_unet.FBPUNet.load_from_checkpoint(str(ckpt_path))
+    finally:
+        mlflow.log_param = orig
 
 def make_trainer(
     *,
@@ -1893,7 +1923,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     extra_valid: Optional[Dict[str, Any]] = None
     progress_cb.report = None  # don't treat post-fit validate() as another training epoch
     if not args.no_final_validate and best_path and best_path.is_file():
-        best_model = fbp_unet.FBPUNet.load_from_checkpoint(str(best_path))
+        best_model = _load_fbpunet_from_checkpoint(best_path)
         setattr(best_model, "_tbx_logger", tbx_logger)
         try:
             val_out = trainer.validate(best_model, dataloaders=valid_loader)
