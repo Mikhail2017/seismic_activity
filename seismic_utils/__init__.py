@@ -39,6 +39,7 @@ from .fb_smooth import DEFAULT_SMOOTH_THRESHOLD, fb_smooth_from_logits, fb_smoot
 from .pickers import (
     ALL_PICKERS,
     HORIZON_SUFFIX,
+    BEFORE_AFTER_SUFFIX,
     NN_PICKERS,
     PICKER_BEFORE_AFTER,
     PICKER_FBPUNET,
@@ -50,6 +51,7 @@ from .pickers import (
     picker_from_hparams,
     picker_from_model,
     spec_for,
+    split_before_after_model,
     split_horizon_model,
 )
 
@@ -84,6 +86,7 @@ __all__ = [
     "resolve_site_config",
     "ALL_PICKERS",
     "DEFAULT_SMOOTH_THRESHOLD",
+    "BEFORE_AFTER_SUFFIX",
     "HORIZON_SUFFIX",
     "NN_PICKERS",
     "PICKER_BEFORE_AFTER",
@@ -99,5 +102,6 @@ __all__ = [
     "picker_from_hparams",
     "picker_from_model",
     "spec_for",
+    "split_before_after_model",
     "split_horizon_model",
 ]

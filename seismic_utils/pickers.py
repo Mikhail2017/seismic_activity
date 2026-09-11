@@ -14,7 +14,8 @@ PICKER_STA_LTA = "sta-lta"
 NN_PICKERS = (PICKER_FBPUNET, PICKER_BEFORE_AFTER)
 ALL_PICKERS = (PICKER_FBPUNET, PICKER_BEFORE_AFTER, PICKER_STA_LTA)
 
-HORIZON_SUFFIX = "-horizon"
+HORIZON_SUFFIX = "-horizon"  # train: first-break prior channel, not this picker
+BEFORE_AFTER_SUFFIX = "-before-after"
 
 
 @dataclass(frozen=True)
@@ -60,18 +61,27 @@ def spec_for(name: str | None) -> PickerSpec:
     return SPECS[normalize_picker(name)]
 
 
-def split_horizon_model(name: str) -> tuple[str, str]:
-    """Split ``resnet34-horizon`` → ``(resnet34, before_after)``."""
+def split_before_after_model(name: str) -> tuple[str, bool]:
+    """Split ``resnet34-before-after`` → ``(resnet34, True)``.
+
+    ``-horizon`` is the first-break prior channel in train, not this picker.
+    """
     raw = (name or "").strip()
     if not raw:
-        return raw, PICKER_FBPUNET
+        return raw, False
     key = raw.lower().replace("_", "-")
-    if key.endswith(HORIZON_SUFFIX):
-        base = key[: -len(HORIZON_SUFFIX)].rstrip("-")
+    if key.endswith(BEFORE_AFTER_SUFFIX):
+        base = key[: -len(BEFORE_AFTER_SUFFIX)].rstrip("-")
         if not base:
-            raise ValueError("'-horizon' needs an encoder preset, e.g. resnet34-horizon")
-        return base, PICKER_BEFORE_AFTER
-    return raw, PICKER_FBPUNET
+            raise ValueError("'-before-after' needs an encoder preset, e.g. resnet34-before-after")
+        return base, True
+    return raw, False
+
+
+def split_horizon_model(name: str) -> tuple[str, str]:
+    """Split ``resnet34-before-after`` → ``(resnet34, before_after)``."""
+    base, is_ba = split_before_after_model(name)
+    return base, PICKER_BEFORE_AFTER if is_ba else PICKER_FBPUNET
 
 
 def picker_from_hparams(hp: Mapping[str, Any] | None) -> str:

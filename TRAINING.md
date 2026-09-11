@@ -2,5 +2,7 @@
 `resnet50`, `efficientnet-b0`, `efficientnet-b4`, `vanilla`, or any SMP encoder
 name. `resnet34-horizon` is ResNet34 plus the linear-moveout first-break prior
 channel (5th input). A `*-horizon` suffix on any preset/SMP encoder does the
-same. `--encoder-weights imagenet` (etc.) initializes the backbone; default is
+same. Before/after masks: `--picker before_after`, YAML `picker: before_after`,
+or `model: resnet34-before-after` (combinable with `-horizon`).
+`--encoder-weights imagenet` (etc.) initializes the backbone; default is
 train from scratch. `--model-config path.yaml` merges on top of the preset.
