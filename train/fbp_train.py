@@ -70,6 +70,7 @@ from seismic_utils.pickers import (
     PICKER_BEFORE_AFTER,
     PICKER_FBPUNET,
     attach_smooth_evaluators,
+    picker_from_hparams,
     spec_for,
     split_before_after_model,
 )
@@ -1663,14 +1664,26 @@ def _load_fbpunet_from_checkpoint(ckpt_path: Path):
     a model from a checkpoint whose saved hparams differ from this run (e.g. resume a
     ``crossentropy`` ckpt then train with ``--loss dice``) raises
     ``UNIQUE constraint failed: params.key`` / ``Changing param values is not allowed``.
+
+    Restore runtime-only picker evaluators from the checkpoint's own hyperparameters
+    so post-fit validation uses the same decoding as validation during training.
     """
     import models.fbp.unet as fbp_unet
+
+    def _load_model():
+        model = fbp_unet.FBPUNet.load_from_checkpoint(str(ckpt_path))
+        # Lightning reconstructs the default FBPEvaluator, not the smooth evaluators
+        # attached before fit(). A two-class default decoder at threshold 0 picks
+        # sample zero everywhere, so restore the saved picker and smoothing window.
+        if picker_from_hparams(model.hparams) == PICKER_BEFORE_AFTER:
+            attach_smooth_evaluators(model, model.hparams)
+        return model
 
     try:
         import mlflow
         from mlflow.exceptions import MlflowException
     except ImportError:
-        return fbp_unet.FBPUNet.load_from_checkpoint(str(ckpt_path))
+        return _load_model()
 
     orig = mlflow.log_param
 
@@ -1683,7 +1696,7 @@ def _load_fbpunet_from_checkpoint(ckpt_path: Path):
 
     mlflow.log_param = _log_param_keep_existing  # type: ignore[method-assign]
     try:
-        return fbp_unet.FBPUNet.load_from_checkpoint(str(ckpt_path))
+        return _load_model()
     finally:
         mlflow.log_param = orig
 
