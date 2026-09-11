@@ -114,6 +114,7 @@ Defaults: **20** epochs, **16** gathers per GPU, early-stop patience **4**.
 conda activate seismic_activity   # or Lightning Studio kernel after setup_lightning.sh
 python train/fbp_train.py --fold A --model resnet34
 python train/fbp_train.py --fold A --patience 0          # no early stop
+python train/fbp_train.py --fold A --ckpt-dir output/train_foldA_resnet34
 python train/fbp_train.py --sites Brunswick,Halfmile --backend npz
 python train/fbp_train.py --list-models
 python train/fbp_train.py --list-folds
@@ -123,7 +124,7 @@ tensorboard --logdir output/train_foldA_resnet34/tensorboard
 ```
 
 Useful flags: `--model` / `--model-config`, `--loss`, `--lr`,
-`--lr-step`, `--batch-size`, `--epochs`, `--patience`, `--num-workers`,
+`--lr-step`, `--batch-size`, `--epochs`, `--patience`, `--ckpt` / `--ckpt-dir`, `--num-workers`,
 `--npz-root`, `--output-dir`, `--encoder-weights`, `--no-final-validate`.
 
 Model presets (`--model`): `resnet18` (default), `resnet34`, `resnet50`, `efficientnet-b0`,

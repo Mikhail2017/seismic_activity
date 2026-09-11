@@ -9,6 +9,8 @@ Launch:
 conda activate seismic_activity
 python train/fbp_train.py --fold A --model resnet34
 python train/fbp_train.py --fold A --patience 0          # train all --epochs
+python train/fbp_train.py --fold A --ckpt output/train_foldA_resnet34/best-epoch=013-step=015232.ckpt
+python train/fbp_train.py --fold A --ckpt-dir output/train_foldA_resnet34
 python train/fbp_train.py --sites Brunswick,Halfmile --backend npz
 python train/fbp_train.py --list-folds
 python train/fbp_train.py --list-models
@@ -123,6 +125,19 @@ trace (`segm_first_break_prob_threshold=0`).
 
 Best checkpoint: `output/.../best-epoch=…-step=….ckpt` (highest `valid/HitRate1px`).
 After fit, the trainer re-validates that checkpoint unless `--no-final-validate`.
+
+Resume a previous run (restores weights, optimizer, scheduler, and epoch):
+
+```bash
+python train/fbp_train.py --fold A --model resnet34 --ckpt path/to/best.ckpt
+python train/fbp_train.py --fold A --ckpt-dir output/train_foldA_resnet34
+```
+
+Use the same `--model` (and architecture flags) as the original run. Only
+`best-*.ckpt` is saved (`save_top_k=1`), so resume is from the best HR@1
+checkpoint, not necessarily the last epoch. Raise `--epochs` if you need a
+higher cap than the original run. `--output-dir` of the original experiment
+keeps new `best-*.ckpt` files in the same folder.
 
 Multi-GPU: batch size stays per GPU. Prefer
 `torchrun --nproc_per_node=N train/fbp_train.py --fold A --devices N`.

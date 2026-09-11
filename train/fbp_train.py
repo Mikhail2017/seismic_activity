@@ -18,6 +18,7 @@ Example::
     python train/fbp_train.py --sites Brunswick --model-config my_model.yaml
     python train/fbp_train.py --fold A --model resnet18
     python train/fbp_train.py --fold A --patience 0  # train all --epochs, no early stop
+    python train/fbp_train.py --fold A --ckpt output/train_foldA_resnet18/best-epoch=013-step=015232.ckpt
     python train/fbp_train.py --list-folds
     # live report: report/train_foldA_resnet18_YYYYMMDD_HHMMSS/report.md
 
@@ -62,6 +63,7 @@ from seismic_utils.dataset import DEFAULT_DATA_DIR
 from seismic_utils.hardpicks_bridge import hardpicks_available, resolve_hardpicks_site_info
 from seismic_utils.hardpicks_pl_compat import ensure_hardpicks_lightning_compat
 from seismic_utils.npz_parser import create_npz_parser
+from seismic_utils.predict import resolve_checkpoint
 
 logger = logging.getLogger("fbp_train")
 
@@ -355,6 +357,18 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         default=None,
         choices=("crossentropy", "dice"),
         help="Segmentation loss (default: crossentropy, or --model-config).",
+    )
+    p.add_argument(
+        "--ckpt",
+        type=Path,
+        default=None,
+        help="Resume Lightning training from this .ckpt (weights, optimizer, epoch).",
+    )
+    p.add_argument(
+        "--ckpt-dir",
+        type=Path,
+        default=None,
+        help="Directory of best*.ckpt; resumes from the newest (used if --ckpt is omitted).",
     )
     p.add_argument("--seed", type=int, default=0)
     p.add_argument(
@@ -1040,6 +1054,8 @@ class TrainingReport:
             lines.append(f"**Fold:** {meta['fold']}")
         if meta.get("eval_ratio") is not None:
             lines.append(f"**Eval ratio:** {meta['eval_ratio']}")
+        if meta.get("resume_ckpt"):
+            lines.append(f"**Resume ckpt:** `{meta['resume_ckpt']}`")
         if meta.get("n_train") is not None:
             lines.append(f"**Train gathers:** {meta['n_train']}")
         if meta.get("n_valid") is not None:
@@ -1521,6 +1537,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     site_label, train_site_names, valid_site_names, eval_ratio = resolve_train_valid_sites(args)
 
+    resume_ckpt: Optional[Path] = None
+    if args.ckpt is not None or args.ckpt_dir is not None:
+        try:
+            resume_ckpt = resolve_checkpoint(args.ckpt, ckpt_dir=args.ckpt_dir)
+        except FileNotFoundError as exc:
+            raise SystemExit(str(exc)) from exc
+
     model_config, model_label = build_model_config(
         model=args.model,
         max_epochs=args.epochs,
@@ -1567,6 +1590,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "batch_size": args.batch_size,
                 "loss": model_config.get("loss_type"),
                 "lr_step": (model_config.get("scheduler_params") or {}).get("step_size"),
+                "resume_ckpt": str(resume_ckpt) if resume_ckpt else None,
                 "backend": args.backend,
                 "output_dir": str(output_root),
                 "devices": args.devices,
@@ -1596,6 +1620,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "| patience:",
         args.patience,
     )
+    if resume_ckpt is not None:
+        print("Resume:", resume_ckpt)
     print("DATA_BACKEND:", args.backend, "| NPZ_ROOT:", npz_root)
 
     config_out = output_root / "model_config.yaml"
@@ -1721,7 +1747,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print("samples", tuple(_batch["samples"].shape), _batch["samples"].dtype)
 
     print(f"Training for up to {args.epochs} epochs (patience={args.patience})…")
-    trainer.fit(model, train_loader, valid_loader)
+    trainer.fit(
+        model,
+        train_loader,
+        valid_loader,
+        ckpt_path=str(resume_ckpt) if resume_ckpt is not None else None,
+    )
 
     is_zero = bool(getattr(trainer, "is_global_zero", rank_zero))
     best_path = Path(checkpoint_cb.best_model_path).resolve() if checkpoint_cb.best_model_path else None
