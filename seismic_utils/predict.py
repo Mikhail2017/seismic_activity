@@ -72,17 +72,11 @@ def load_fbp_model(ckpt_path: str | Path, *, device: str | None = None):
     return model
 
 
-def decode_fb_picks(raw_preds, model):
-    """Logits → per-trace sample indices (same scheme as ``FBPEvaluator``)."""
-    import hardpicks.metrics.fbp.utils as metrics_utils
+def decode_fb_picks(raw_preds, model, *, picker: str | None = None, smooth_threshold: int | None = None):
+    """Logits → per-trace sample indices."""
+    from .pickers import decode_nn_picks
 
-    scheme = int(model.test_evaluator.segm_class_count)
-    thresh = float(model.test_evaluator.segm_first_break_prob_threshold)
-    return metrics_utils.get_regr_preds_from_raw_preds(
-        raw_preds=raw_preds,
-        segm_class_count=scheme,
-        prob_threshold=thresh,
-    )
+    return decode_nn_picks(raw_preds, model, picker=picker, smooth_threshold=smooth_threshold)
 
 
 def shot_gather_to_inference_dict(
@@ -152,20 +146,29 @@ def _prepare_gather_for_inference(gather: dict[str, Any]) -> dict[str, Any]:
 def predict_first_breaks_ms(
     model,
     hardpicks_gather: dict[str, Any],
+    *,
+    picker: str | None = None,
+    smooth_threshold: int | None = None,
 ) -> np.ndarray:
     """
     Run the model on one hardpicks-style gather dict.
 
     Returns predicted first-break times in milliseconds, shape ``(n_traces,)``.
     Invalid / no-pick traces are ``NaN``.
+
+    *picker* selects the decode head (``fbpunet`` vs ``before_after``). Default:
+    checkpoint ``hparams.picker`` / ``segm_class_count``.
     """
     import torch
     import hardpicks.data.fbp.data_module as fbp_data_module
     import hardpicks.models.fbp.utils as model_utils
 
+    from .pickers import picker_from_model
+
     prepared = _prepare_gather_for_inference(hardpicks_gather)
     n_traces = int(prepared["trace_count"])
     dt_ms = float(prepared["sample_rate_ms"])
+    resolved_picker = picker or picker_from_model(model)
 
     batch = fbp_data_module.fbp_batch_collate([prepared], pad_to_nearest_pow2=True)
     with torch.no_grad():
@@ -175,7 +178,9 @@ def predict_first_breaks_ms(
             use_first_break_prior=model.use_first_break_prior,
         ).to(model.device).float()
         logits = model(input_tensor)
-        pred_idx, _ = decode_fb_picks(logits, model)
+        pred_idx, _ = decode_fb_picks(
+            logits, model, picker=resolved_picker, smooth_threshold=smooth_threshold
+        )
 
     idx = pred_idx[0, :n_traces].detach().cpu().numpy().astype(np.float64)
     fb_ms = idx * dt_ms
@@ -183,6 +188,17 @@ def predict_first_breaks_ms(
     return fb_ms
 
 
-def predict_first_breaks_ms_from_shot_gather(model, gather: ShotGather) -> np.ndarray:
+def predict_first_breaks_ms_from_shot_gather(
+    model,
+    gather: ShotGather,
+    *,
+    picker: str | None = None,
+    smooth_threshold: int | None = None,
+) -> np.ndarray:
     """Predict FB times from a native ``ShotGather`` (no hardpicks HDF5 open)."""
-    return predict_first_breaks_ms(model, shot_gather_to_inference_dict(gather))
+    return predict_first_breaks_ms(
+        model,
+        shot_gather_to_inference_dict(gather),
+        picker=picker,
+        smooth_threshold=smooth_threshold,
+    )

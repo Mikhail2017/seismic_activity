@@ -35,6 +35,23 @@ from .sta_lta import (
     pick_first_breaks_ms,
     pick_first_breaks_ms_from_shot_gather,
 )
+from .fb_smooth import DEFAULT_SMOOTH_THRESHOLD, fb_smooth_from_logits, fb_smooth_result
+from .pickers import (
+    ALL_PICKERS,
+    HORIZON_SUFFIX,
+    NN_PICKERS,
+    PICKER_BEFORE_AFTER,
+    PICKER_FBPUNET,
+    PICKER_STA_LTA,
+    PickerSpec,
+    attach_smooth_evaluators,
+    decode_nn_picks,
+    normalize_picker,
+    picker_from_hparams,
+    picker_from_model,
+    spec_for,
+    split_horizon_model,
+)
 
 __all__ = [
     "DEFAULT_DATA_DIR",
@@ -65,5 +82,22 @@ __all__ = [
     "resolve_hardpicks_site_info",
     "resolve_npz_asset_dir",
     "resolve_site_config",
+    "ALL_PICKERS",
+    "DEFAULT_SMOOTH_THRESHOLD",
+    "HORIZON_SUFFIX",
+    "NN_PICKERS",
+    "PICKER_BEFORE_AFTER",
+    "PICKER_FBPUNET",
+    "PICKER_STA_LTA",
+    "PickerSpec",
     "StaLtaOptions",
+    "attach_smooth_evaluators",
+    "decode_nn_picks",
+    "fb_smooth_from_logits",
+    "fb_smooth_result",
+    "normalize_picker",
+    "picker_from_hparams",
+    "picker_from_model",
+    "spec_for",
+    "split_horizon_model",
 ]

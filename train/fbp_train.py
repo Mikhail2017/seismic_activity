@@ -62,9 +62,16 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from seismic_utils.dataset import DEFAULT_DATA_DIR
+from seismic_utils.fb_smooth import DEFAULT_SMOOTH_THRESHOLD
 from seismic_utils.hardpicks_bridge import hardpicks_available, resolve_hardpicks_site_info
 from seismic_utils.hardpicks_pl_compat import ensure_hardpicks_lightning_compat
 from seismic_utils.npz_parser import create_npz_parser
+from seismic_utils.pickers import (
+    PICKER_BEFORE_AFTER,
+    attach_smooth_evaluators,
+    spec_for,
+    split_horizon_model,
+)
 from seismic_utils.predict import resolve_checkpoint
 
 logger = logging.getLogger("fbp_train")
@@ -413,8 +420,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--model",
         default="resnet18",
         help=(
-            "Architecture preset name, or any SMP encoder id "
-            f"(presets: {preset_names})."
+            "Architecture preset, or any SMP encoder id. "
+            "Append -horizon for a before/after first-break head "
+            f"(e.g. resnet34-horizon). Presets: {preset_names}."
         ),
     )
     p.add_argument(
@@ -466,6 +474,15 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         default=None,
         choices=("crossentropy", "dice"),
         help="Segmentation loss (default: crossentropy, or --model-config).",
+    )
+    p.add_argument(
+        "--smooth-threshold",
+        type=int,
+        default=None,
+        help=(
+            "Horizon-head pick smoother window in samples "
+            f"(default: {DEFAULT_SMOOTH_THRESHOLD}; used with --model *-horizon)."
+        ),
     )
     p.add_argument(
         "--ckpt",
@@ -634,19 +651,23 @@ def build_model_config(
     loss_type: Optional[str] = None,
     lr_step: Optional[int] = None,
     recipe: Optional[Dict[str, Any]] = None,
+    smooth_threshold: Optional[int] = None,
 ) -> tuple[Dict[str, Any], str]:
     """Build FBPUNet hyperparams from a preset and/or YAML/JSON override.
 
     Returns ``(hyper_params, model_label)`` where ``model_label`` is used in
     output paths and logs.
     """
-    model_label = resolve_model_name(model)
+    encoder_name, picker = split_horizon_model(model)
+    model_label = resolve_model_name(encoder_name)
     if model_label in MODEL_PRESETS:
         arch = copy.deepcopy(MODEL_PRESETS[model_label])
     else:
         # Treat as a raw encoder id (must be known to SMP at construct time).
         arch = {"unet_encoder_type": model_label, **_decoder_for_encoder(model_label)}
         model_label = model_label.replace("/", "-")
+    if picker == PICKER_BEFORE_AFTER:
+        model_label = f"{model_label}-horizon"
 
     file_overrides: Dict[str, Any] = {}
     if model_config_path is not None:
@@ -743,8 +764,13 @@ def build_model_config(
         sched = dict(base.get("scheduler_params") or {})
         sched["step_size"] = int(lr_step)
         base["scheduler_params"] = sched
-    # Binary first-break vs not (ternary is not supported in this trainer).
-    base["segm_class_count"] = SEGMENTATION_CLASS_COUNT
+
+    picker_spec = spec_for(picker)
+    base["picker"] = picker_spec.name
+    base["segm_class_count"] = int(picker_spec.segm_class_count or 1)
+    base["segm_first_break_smooth_threshold"] = int(
+        smooth_threshold if smooth_threshold is not None else DEFAULT_SMOOTH_THRESHOLD
+    )
 
     base["max_epochs"] = max_epochs
     base["model_type"] = base.get("model_type") or "FBPUNet"
@@ -769,6 +795,7 @@ def list_models() -> None:
         "(decoder channels are inferred)."
     )
     print("Pretrained backbones: --encoder-weights imagenet  (or ssl/swsl/… per encoder)")
+    print("Horizon head: append -horizon (e.g. resnet34-horizon) for before/after segmentation.")
     print("Override anything with --model-config path/to.yaml")
 
 
@@ -1731,6 +1758,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         loss_type=args.loss,
         lr_step=args.lr_step,
         recipe=getattr(args, "train_recipe", None),
+        smooth_threshold=args.smooth_threshold,
     )
     model_slug = "".join(c if c.isalnum() or c in "-_" else "-" for c in model_label.lower())
 
@@ -1760,6 +1788,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "run_name": run_name,
                 "model": model_label,
                 "encoder": model_config.get("unet_encoder_type"),
+                "picker": model_config.get("picker"),
+                "segm_class_count": model_config.get("segm_class_count"),
+                "smooth_threshold": model_config.get("segm_first_break_smooth_threshold"),
                 "fold": site_label if eval_ratio is None else None,
                 "train_sites": list(train_site_names),
                 "valid_sites": list(valid_site_names),
@@ -1794,6 +1825,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     else:
         print("Sites:", train_site_names, f"| eval_ratio={eval_ratio}")
     print("Model:", model_label, "| encoder:", model_config.get("unet_encoder_type"))
+    print(
+        "picker:",
+        model_config.get("picker"),
+        "| segm_class_count:",
+        model_config.get("segm_class_count"),
+    )
     print("encoder_weights:", model_config.get("encoder_weights"))
     print(
         "loss:",
@@ -1870,7 +1907,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         data_dir=args.data_dir,
         npz_root=npz_root,
         eval_ratio=eval_ratio,
-        segm_class_count=SEGMENTATION_CLASS_COUNT,
+        segm_class_count=int(model_config.get("segm_class_count") or SEGMENTATION_CLASS_COUNT),
         augmentations=getattr(args, "train_augmentations", None),
     )
     train_loader, valid_loader = build_loaders(
@@ -1894,6 +1931,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         report._write_markdown()
 
     model = fbp_unet.FBPUNet(model_config)
+    if str(model_config.get("picker") or "") == PICKER_BEFORE_AFTER:
+        attach_smooth_evaluators(model, model_config)
     setattr(model, "_tbx_logger", tbx_logger)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"FBPUNet[{model_label}] ready: {n_params / 1e6:.2f}M trainable parameters")
