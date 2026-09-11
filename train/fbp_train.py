@@ -12,18 +12,18 @@ hyperparameter file. Optional SMP backbone pretraining via ``--encoder-weights``
 Example::
 
     conda activate seismic_activity
-    python examples/local/fbp_train.py --sites Brunswick --model resnet18 --epochs 5
-    python examples/local/fbp_train.py --sites Brunswick --model efficientnet-b0 \\
+    python train/fbp_train.py --sites Brunswick --model resnet18 --epochs 5
+    python train/fbp_train.py --sites Brunswick --model efficientnet-b0 \\
         --encoder-weights imagenet
-    python examples/local/fbp_train.py --sites Brunswick --model-config my_model.yaml
-    python examples/local/fbp_train.py --fold A --model resnet18 --epochs 20
-    python examples/local/fbp_train.py --list-folds
-    # live report: report/train_foldA_resnet18/report.md
+    python train/fbp_train.py --sites Brunswick --model-config my_model.yaml
+    python train/fbp_train.py --fold A --model resnet18 --epochs 20
+    python train/fbp_train.py --list-folds
+    # live report: report/train_foldA_resnet18_YYYYMMDD_HHMMSS/report.md
 
     # multi-GPU (batch size is per GPU). Prefer torchrun for DDP:
-    torchrun --nproc_per_node=4 examples/local/fbp_train.py --fold A --devices 4
-    python examples/local/fbp_train.py --fold A --devices 2 --strategy ddp_spawn
-    python examples/local/fbp_train.py --fold A --devices 0,1 --strategy dp
+    torchrun --nproc_per_node=4 train/fbp_train.py --fold A --devices 4
+    python train/fbp_train.py --fold A --devices 2 --strategy ddp_spawn
+    python train/fbp_train.py --fold A --devices 0,1 --strategy dp
 
     tensorboard --logdir output/train_brunswick_resnet18/tensorboard
 """
@@ -53,7 +53,7 @@ import torch
 import torch.utils.data
 import yaml
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
@@ -270,7 +270,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--report-dir",
         type=Path,
         default=None,
-        help="Training report root (default: <repo>/report/<run-name>/).",
+        help="Training report root (default: <repo>/report/<run-name>_<YYYYMMDD_HHMMSS>/).",
     )
     p.add_argument(
         "--model",
@@ -384,7 +384,7 @@ def list_folds() -> None:
     print("\nUnavailable here:")
     for fold_id, reason in sorted(UNAVAILABLE_FOLDS.items()):
         print(f"  {fold_id}    {reason}")
-    print("\nExample: python examples/local/fbp_train.py --fold A --epochs 20")
+    print("\nExample: python train/fbp_train.py --fold A --epochs 20")
 
 
 def resolve_train_valid_sites(args: argparse.Namespace) -> tuple[str, List[str], List[str], Optional[float]]:
@@ -604,23 +604,28 @@ def _site_params(*, augment: bool, eval_ratio: Optional[float], use_eval_split: 
     return params
 
 
-def build_parsers(
-    train_site_names: Sequence[str],
-    valid_site_names: Sequence[str],
+def build_split_parser(
+    site_names: Sequence[str],
+    *,
+    prefix: str,
     backend: str,
     data_dir: Path,
     npz_root: Path,
     eval_ratio: Optional[float],
+    augment: bool,
+    use_eval_split: bool,
 ):
+    """Build a concatenated parser for one split (train or valid)."""
     import hardpicks
     import hardpicks.data.fbp.data_module as fbp_data_module
 
-    train_parts: list = []
-    valid_parts: list = []
+    parts: list = []
     backend = backend.strip().lower()
+    if not site_names:
+        raise ValueError(f"no sites provided for {prefix} split")
 
     if backend == "npz":
-        def _add_npz(site_name: str, prefix: str, parts: list, *, augment: bool, use_eval_split: bool) -> None:
+        for site_name in site_names:
             logger.info("NPZ parser (%s): %s", prefix, npz_root / site_name)
             parts.append(
                 create_npz_parser(
@@ -635,17 +640,11 @@ def build_parsers(
                     segm_class_count=SEGMENTATION_CLASS_COUNT,
                 )
             )
-
-        for site_name in train_site_names:
-            _add_npz(site_name, "train", train_parts, augment=True, use_eval_split=False)
-        for site_name in valid_site_names:
-            _add_npz(site_name, "valid", valid_parts, augment=False, use_eval_split=True)
     elif backend == "hdf5":
         rejected = Path(hardpicks.FBP_BAD_GATHERS_DIR) / "bad-gather-ids_combined.yaml"
         if not rejected.is_file():
             rejected = None
             logger.warning("bad-gather YAML not found; continuing without reject list")
-
         hdf5_site_params = {
             "rejected_gather_yaml_path": str(rejected) if rejected else None,
             "use_cache": False,
@@ -657,8 +656,7 @@ def build_parsers(
             cache_trace_metadata=True,
             provide_offset_dists=True,
         )
-
-        def _add_hdf5(site_name: str, prefix: str, parts: list, *, augment: bool, use_eval_split: bool) -> None:
+        for site_name in site_names:
             site_info = resolve_hardpicks_site_info(site_name, data_dir=data_dir)
             logger.info("HDF5 parser (%s): %s", prefix, site_name)
             for k, v in site_info.items():
@@ -679,27 +677,47 @@ def build_parsers(
                     segm_class_count=SEGMENTATION_CLASS_COUNT,
                 )
             )
-
-        for site_name in train_site_names:
-            _add_hdf5(site_name, "train", train_parts, augment=True, use_eval_split=False)
-        for site_name in valid_site_names:
-            _add_hdf5(site_name, "valid", valid_parts, augment=False, use_eval_split=True)
     else:
         raise ValueError(f"Unknown backend={backend!r}; use 'npz' or 'hdf5'")
 
-    train_parser = _concat_or_single(train_parts)
-    valid_parser = _concat_or_single(valid_parts)
+    for site_name, parser in zip(site_names, parts):
+        logger.info("  %s %s: %d gathers", prefix, site_name, len(parser))
+    return _concat_or_single(parts)
 
-    for site_name, parser in zip(train_site_names, train_parts):
-        logger.info("  train %s: %d gathers", site_name, len(parser))
-    for site_name, parser in zip(valid_site_names, valid_parts):
-        logger.info("  valid %s: %d gathers", site_name, len(parser))
+
+def build_parsers(
+    train_site_names: Sequence[str],
+    valid_site_names: Sequence[str],
+    backend: str,
+    data_dir: Path,
+    npz_root: Path,
+    eval_ratio: Optional[float],
+):
+    train_parser = build_split_parser(
+        train_site_names,
+        prefix="train",
+        backend=backend,
+        data_dir=data_dir,
+        npz_root=npz_root,
+        eval_ratio=eval_ratio,
+        augment=True,
+        use_eval_split=False,
+    )
+    valid_parser = build_split_parser(
+        valid_site_names,
+        prefix="valid",
+        backend=backend,
+        data_dir=data_dir,
+        npz_root=npz_root,
+        eval_ratio=eval_ratio,
+        augment=False,
+        use_eval_split=True,
+    )
     logger.info(
         "Total train gathers: %d | Valid gathers: %d",
         len(train_parser),
         len(valid_parser),
     )
-
     train_keys = {_gather_key(train_parser.get_meta_gather(i)) for i in range(len(train_parser))}
     valid_keys = {_gather_key(valid_parser.get_meta_gather(i)) for i in range(len(valid_parser))}
     assert not (train_keys & valid_keys), "train/valid gather keys overlap"
@@ -1453,6 +1471,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     npz_root = args.npz_root or (args.data_dir / "npz")
     run_name = f"train_{site_label}_{model_slug}"
+    run_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_root = (args.output_dir or (REPO_ROOT / "output" / run_name)).resolve()
     output_root.mkdir(parents=True, exist_ok=True)
 
@@ -1466,7 +1485,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     pl.seed_everything(args.seed, workers=True)
 
     report_root = (args.report_dir or (REPO_ROOT / "report")).resolve()
-    report_dir = report_root / run_name
+    report_dir = report_root / f"{run_name}_{run_stamp}"
     rank_zero = env_is_rank_zero()
     report: Optional[TrainingReport] = None
     if rank_zero:
@@ -1487,6 +1506,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "devices": args.devices,
                 "strategy": args.strategy,
                 "precision": args.precision,
+                "run_stamp": run_stamp,
             },
         )
 
