@@ -106,7 +106,9 @@ CLI script (recommended) — TensorBoard + CSV logs, step/epoch progress with lo
 ```bash
 conda activate seismic_activity   # or Lightning Studio kernel after setup_lightning.sh
 python train/fbp_train.py --sites Brunswick,Halfmile --backend npz --epochs 5
+python train/fbp_train.py --fold A --model resnet34 --epochs 15
 python train/fbp_train.py --list-models
+python train/fbp_train.py --list-folds
 python train/fbp_train.py --sites Brunswick --model efficientnet-b0 --epochs 5
 
 # watch metrics
@@ -134,6 +136,42 @@ Both write under `output/train_<sites>/`: best checkpoint (`valid/HitRate1px`),
 `epoch_metrics.csv`, and `train_valid_curves.png`. Live training notes go to
 `report/<run>_<YYYYMMDD_HHMMSS>/`.
 
+## Site folds
+
+`--fold` is a **whole-site holdout** (no intra-site `--eval-ratio` split). It is
+mutually exclusive with `--sites`. Sites in this repo: **Brunswick, Halfmile,
+Lalor, Sudbury**. Hardpicks also has Kevitsa/Matagami; those files are not here,
+so fold **E** cannot run.
+
+Folds A–D are leave-one-site-out (3 train / 1 valid). Fold A matches hardpicks
+`foldA.yaml` exactly; B–D are the same rotation with Kevitsa/Matagami dropped.
+F–K match the hardpicks YAMLs that already omit Kevitsa (2 train / 1 valid).
+
+```bash
+python train/fbp_train.py --fold A --model resnet34 --epochs 15
+python train/fbp_train.py --list-folds
+```
+
+Accepts `A`, `foldA`, `fold_a`. The same `--fold` is used at eval time so the
+validation site matches training.
+
+| Fold | Train | Valid |
+| --- | --- | --- |
+| A | Lalor, Brunswick, Sudbury | Halfmile |
+| B | Lalor, Brunswick, Halfmile | Sudbury |
+| C | Halfmile, Lalor, Sudbury | Brunswick |
+| D | Sudbury, Halfmile, Brunswick | Lalor |
+| E | — | unavailable (needs Matagami/Kevitsa) |
+| F | Halfmile, Brunswick | Sudbury |
+| G | Brunswick, Sudbury | Halfmile |
+| H | Halfmile, Lalor | Brunswick |
+| I | Sudbury, Halfmile | Lalor |
+| J | Lalor, Brunswick | Sudbury |
+| K | Brunswick, Sudbury | Halfmile |
+
+G and K have the same split; they exist as separate letters because hardpicks
+defines both YAMLs.
+
 ## Validation / prediction report
 
 After training, score a checkpoint on the fold (or site) validation split and write
@@ -145,7 +183,7 @@ python train/fbp_eval.py --ckpt-dir /path/to/weights/baseline/foldA --fold A --b
 python train/fbp_eval.py --ckpt output/train_foldA_resnet34/best-epoch=013-step=015232.ckpt --fold A --backend npz
 ```
 
-`--fold` uses the same whole-site holdout as training (fold A valid = Halfmile).
+`--fold` uses the same whole-site holdout as training (see **Site folds** above).
 `--sites` evaluates those sites; add `--eval-ratio 0.15` to reuse the intra-site
 holdout from `fbp_train.py`.
 
