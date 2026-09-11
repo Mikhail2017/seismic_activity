@@ -18,6 +18,7 @@ Example::
     python train/fbp_train.py --sites Brunswick --model-config my_model.yaml
     python train/fbp_train.py --fold A --model resnet18
     python train/fbp_train.py --fold A --patience 0  # train all --epochs, no early stop
+    python train/fbp_train.py --fold A --save-top-k -1  # keep a ckpt after every epoch
     python train/fbp_train.py --config configs/train.yaml --fold A
     python train/fbp_train.py --list-folds
     python train/fbp_train.py --fold A --ckpt output/train_foldA_resnet18/best-epoch=013-step=015232.ckpt
@@ -90,6 +91,7 @@ _RECIPE_TRAINER_KEYS = (
     "epochs",
     "batch_size",
     "patience",
+    "save_top_k",
     "precision",
     "num_workers",
     "log_every_n_steps",
@@ -376,6 +378,16 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         default=4,
         help="Early-stop patience on valid/HitRate1px (0 disables early stopping).",
     )
+    p.add_argument(
+        "--save-top-k",
+        type=int,
+        default=1,
+        metavar="K",
+        help=(
+            "Keep the K best checkpoints by valid/HitRate1px "
+            "(1 = best only, -1 = save after every epoch)."
+        ),
+    )
     p.add_argument("--num-workers", type=int, default=2)
     p.add_argument(
         "--devices",
@@ -531,6 +543,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     args.train_recipe = recipe
     args.train_config_path = config_path
     args.train_augmentations = resolve_train_augmentations(recipe)
+    if int(args.save_top_k) < -1:
+        p.error("--save-top-k must be -1 (every epoch) or >= 0")
+    args.save_top_k = int(args.save_top_k)
     return args
 
 
@@ -1300,6 +1315,7 @@ class TrainingReport:
             [
                 f"**Epochs:** {meta.get('epochs', '')}",
                 f"**Early-stop patience:** {meta.get('patience', '')}",
+                f"**Save top-k checkpoints:** {meta.get('save_top_k', '')}",
                 f"**Batch size (per device):** {meta.get('batch_size', '')}",
                 f"**Loss:** {meta.get('loss', '')}",
                 f"**LR step:** {meta.get('lr_step', '')}",
@@ -1714,18 +1730,22 @@ def _load_fbpunet_from_checkpoint(ckpt_path: Path):
         mlflow.log_param = orig
 
 
-def make_model_checkpoint(dirpath: Path | str) -> pl.callbacks.ModelCheckpoint:
-    """Save the top ``valid/HitRate1px`` checkpoint, overwriting same-name leftovers.
+def make_model_checkpoint(
+    dirpath: Path | str, *, save_top_k: int = 1
+) -> pl.callbacks.ModelCheckpoint:
+    """Save the top ``valid/HitRate1px`` checkpoints, overwriting same-name leftovers.
 
-    ``enable_version_counter=False`` avoids ``best-epoch=…-v1.ckpt`` when the
-    output dir still has a previous run's file with the same epoch/step name.
+    ``save_top_k=1`` keeps the single best file. ``save_top_k=-1`` writes a
+    checkpoint after every validation epoch. ``enable_version_counter=False``
+    avoids ``best-epoch=…-v1.ckpt`` when the output dir still has a previous
+    run's file with the same epoch/step name.
     """
     kwargs: Dict[str, Any] = dict(
         dirpath=str(dirpath),
         filename="best-{epoch:03d}-{step:06d}",
         monitor=MONITOR_METRIC,
         mode="max",
-        save_top_k=1,
+        save_top_k=int(save_top_k),
     )
     try:
         return pl.callbacks.ModelCheckpoint(**kwargs, enable_version_counter=False)
@@ -1924,6 +1944,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "eval_ratio": eval_ratio,
                 "epochs": args.epochs,
                 "patience": args.patience,
+                "save_top_k": args.save_top_k,
                 "batch_size": args.batch_size,
                 "loss": model_config.get("loss_type"),
                 "lr_step": (model_config.get("scheduler_params") or {}).get("step_size"),
@@ -1967,6 +1988,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         (model_config.get("scheduler_params") or {}).get("step_size"),
         "| patience:",
         args.patience,
+        "| save_top_k:",
+        args.save_top_k,
     )
     augs = getattr(args, "train_augmentations", None) or []
     print("augmentations:", ", ".join(_aug_type_names(augs)) or "none")
@@ -2066,7 +2089,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"FBPUNet[{model_label}] ready: {n_params / 1e6:.2f}M trainable parameters")
 
-    checkpoint_cb = make_model_checkpoint(output_root)
+    checkpoint_cb = make_model_checkpoint(output_root, save_top_k=args.save_top_k)
     progress_cb = ProgressMetricsCallback(
         print_every_n_steps=args.print_every_n_steps,
         report=report,
