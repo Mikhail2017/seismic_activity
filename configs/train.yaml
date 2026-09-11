@@ -21,7 +21,8 @@ log_every_n_steps: 10
 print_every_n_steps: 50
 
 # Model recipe
-model: resnet18
+model: resnet18              # append -before-after for before/after head; *-horizon = prior channel
+# picker: fbpunet            # fbpunet | before_after (or set via --picker / model suffix)
 encoder_weights: null        # e.g. imagenet
 loss: crossentropy           # crossentropy | dice
 lr: null                     # null = preset LR for --model
