@@ -30,6 +30,12 @@ def annotate_trace_frame(
 ) -> pd.DataFrame:
     """Add Origin, |error|, and millisecond columns."""
     out = df.copy()
+    for col in ("OriginId", "GatherId", "ShotId", "ReceiverId", "Predictions"):
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce").astype("Int64")
+    for col in ("Offset", "Errors", "Probabilities", "GatherCoverage", "ExpectedCoverage"):
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
     id_to_name = origin_name_map(origin_id_map)
     if "OriginId" in out.columns:
         out["Origin"] = out["OriginId"].map(id_to_name)
@@ -37,6 +43,23 @@ def annotate_trace_frame(
         out["Origin"] = "unknown"
     abs_err = out["Errors"].abs() if "Errors" in out.columns else pd.Series(np.nan, index=out.index)
     out["AbsError"] = abs_err
+
+    def _rate(origin: Any) -> float:
+        name = str(origin)
+        if name in sample_rate_ms_by_origin:
+            return float(sample_rate_ms_by_origin[name])
+        name_l = name.lower()
+        for key, value in sample_rate_ms_by_origin.items():
+            key_l = str(key).lower()
+            if key_l in name_l or name_l in key_l:
+                return float(value)
+        return float(default_sample_rate_ms)
+
+    dt = out["Origin"].map(_rate)
+    out["SampleRateMs"] = dt
+    out["ErrorMs"] = out["Errors"] * dt
+    out["AbsErrorMs"] = abs_err * dt
+    return out
 
     def _rate(origin: Any) -> float:
         name = str(origin)
@@ -98,10 +121,11 @@ def headline_metrics(df: pd.DataFrame) -> Dict[str, Any]:
 
 def offset_bin_table(df: pd.DataFrame, n_bins: int = 12) -> pd.DataFrame:
     labeled = df[df["Errors"].notna()].copy()
-    if labeled.empty or labeled["Offset"].nunique() < 2:
+    if labeled.empty or "Offset" not in labeled.columns:
         return pd.DataFrame()
-    labeled = labeled[np.isfinite(labeled["Offset"])]
-    if labeled.empty:
+    labeled["Offset"] = pd.to_numeric(labeled["Offset"], errors="coerce")
+    labeled = labeled[np.isfinite(labeled["Offset"].to_numpy(dtype=np.float64, copy=False))]
+    if labeled.empty or labeled["Offset"].nunique() < 2:
         return pd.DataFrame()
     try:
         labeled["offset_bin"] = pd.qcut(labeled["Offset"], q=min(n_bins, labeled["Offset"].nunique()), duplicates="drop")
