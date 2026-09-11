@@ -50,7 +50,7 @@ with `SEISMIC_BACKEND=hardpicks`.
 - `seismic_utils/fbp_eval_report.py` — validation report (scalars, Plotly HTML, gather PNGs)
 - `models/` — local FBPUNet (cloned from hardpicks) used by `train/fbp_train.py`
 - `train/fbp_train.py` — training CLI (folds, multi-GPU, living `report/` log)
-- `configs/train.yaml` — default training recipe (epochs, batch, patience, loss/LR)
+- `configs/train.yaml` — default training recipe (epochs, batch, patience, save_top_k, loss/LR)
 - `TRAINING.md` — actual training pipeline (this repo)
 - `original_hardpicks.md` — paper / hardpicks search recipe
 - `train/fbp_eval.py` — checkpoint validation / prediction report CLI
@@ -118,6 +118,7 @@ conda activate seismic_activity   # or Lightning Studio kernel after setup_light
 python train/fbp_train.py --fold A --model resnet34
 python train/fbp_train.py --config configs/train.yaml --fold A
 python train/fbp_train.py --fold A --patience 0          # no early stop
+python train/fbp_train.py --fold A --save-top-k -1       # checkpoint after every epoch
 python train/fbp_train.py --fold A --ckpt-dir output/train_foldA_resnet34
 python train/fbp_train.py --sites Brunswick,Halfmile --backend npz
 python train/fbp_train.py --list-models
@@ -128,7 +129,7 @@ tensorboard --logdir output/train_foldA_resnet34/tensorboard
 ```
 
 Useful flags: `--config`, `--model` / `--model-config`, `--loss`, `--lr`,
-`--lr-step`, `--batch-size`, `--epochs`, `--patience`, `--ckpt` / `--ckpt-dir`, `--num-workers`,
+`--lr-step`, `--batch-size`, `--epochs`, `--patience`, `--save-top-k`, `--ckpt` / `--ckpt-dir`, `--num-workers`,
 `--npz-root`, `--output-dir`, `--encoder-weights`, `--no-final-validate`.
 
 Model presets (`--model`): `resnet18` (default), `resnet34`, `resnet50`, `efficientnet-b0`,

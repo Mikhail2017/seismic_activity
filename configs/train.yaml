@@ -15,6 +15,7 @@ eval_ratio: 0.15             # ignored when --fold is set
 epochs: 20
 batch_size: 16               # per GPU
 patience: 4                  # 0 = no early stop
+save_top_k: 1                # checkpoints kept by valid/HitRate1px; -1 = every epoch
 precision: "32"
 num_workers: 2
 log_every_n_steps: 10
