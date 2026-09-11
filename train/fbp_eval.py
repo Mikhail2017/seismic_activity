@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Validate first-break picks and write a rich prediction report.
 
-Default is an FBPUNet checkpoint. Pass ``--picker sta-lta`` to score the
-Jones & van der Baan adaptive STA-LTA (no checkpoint).
+Default is an FB-pixel FBPUNet checkpoint (``--picker fbpunet``).
+Pass ``--picker before_after`` for a horizon (before/after) UNet, or
+``--picker sta-lta`` for Jones & van der Baan adaptive STA-LTA (no checkpoint).
+If a checkpoint's stored picker disagrees with ``--picker``, the checkpoint wins.
 
     report/eval_<label>_<YYYYMMDD_HHMMSS>/
       report.md  index.html  stats.html  worst.html  typical.html
@@ -16,6 +18,8 @@ Example::
     python train/fbp_eval.py --ckpt output/train_foldA_resnet34/best-epoch=013-step=015232.ckpt \\
         --fold A --backend npz
     python train/fbp_eval.py --picker sta-lta --fold A --backend hdf5
+    python train/fbp_eval.py --picker before_after --ckpt-dir output/train_foldA_resnet34-horizon \\
+        --fold A --backend hdf5
 """
 
 from __future__ import annotations
@@ -24,10 +28,12 @@ import argparse
 import functools
 import json
 import logging
+import multiprocessing as mp
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, Iterator, List, Optional, Sequence
 
 import numpy as np
 import pandas as pd
@@ -54,8 +60,18 @@ from seismic_utils.fbp_eval_report import (
     write_trace_table,
     write_worst_html,
 )
+from seismic_utils.fb_smooth import DEFAULT_SMOOTH_THRESHOLD
 from seismic_utils.hardpicks_bridge import hardpicks_available, hardpicks_item_to_shot_gather
 from seismic_utils.hardpicks_pl_compat import ensure_hardpicks_lightning_compat
+from seismic_utils.pickers import (
+    NN_PICKERS,
+    PICKER_BEFORE_AFTER,
+    PICKER_STA_LTA,
+    make_eval_evaluator,
+    picker_from_hparams,
+    reconcile_cli_picker,
+    spec_for,
+)
 from seismic_utils.predict import load_fbp_model, resolve_checkpoint
 
 import fbp_train as train_cli
@@ -77,14 +93,18 @@ EVAL_METRICS: List[Dict[str, Any]] = [
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Validate FBPUNet or STA-LTA-OS first-break picks and write a prediction report.",
+        description="Validate FBPUNet, horizon (before/after) UNet, or STA-LTA-OS first-break picks.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument(
         "--picker",
-        choices=("fbpunet", "sta-lta"),
+        choices=("fbpunet", "before_after", "sta-lta"),
         default="fbpunet",
-        help="fbpunet needs --ckpt/--ckpt-dir; sta-lta is Jones & van der Baan adaptive STA-LTA.",
+        help=(
+            "fbpunet / before_after need --ckpt/--ckpt-dir; "
+            "sta-lta is Jones & van der Baan adaptive STA-LTA. "
+            "A checkpoint's stored picker wins on mismatch."
+        ),
     )
     p.add_argument("--ckpt", type=Path, default=None, help="Path to a .ckpt file.")
     p.add_argument(
@@ -132,10 +152,19 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         default=0.05,
         help="STA-LTA-OS short window in seconds (paper: 0.05 s at 4 kHz).",
     )
+    p.add_argument(
+        "--smooth-threshold",
+        type=int,
+        default=None,
+        help=(
+            "Horizon (before/after) pick smoother window in samples "
+            f"(default: checkpoint hparams or {DEFAULT_SMOOTH_THRESHOLD})."
+        ),
+    )
     p.add_argument("-v", "--verbose", action="store_true")
     p.add_argument("--list-folds", action="store_true")
     args = p.parse_args(argv)
-    if not args.list_folds and args.picker == "fbpunet" and args.ckpt is None and args.ckpt_dir is None:
+    if not args.list_folds and args.picker in NN_PICKERS and args.ckpt is None and args.ckpt_dir is None:
         p.error("Provide --ckpt or --ckpt-dir (or use --picker sta-lta)")
     return args
 
@@ -320,77 +349,49 @@ def _sta_lta_options_from_args(args: argparse.Namespace):
     return StaLtaOptions(th=float(args.sta_lta_th), lw_s=float(args.sta_lta_lw), sw_s=float(args.sta_lta_sw))
 
 
-def run_sta_lta_eval(parser, opts) -> tuple[pd.DataFrame, Dict[str, int], Dict[str, float]]:
-    """Score STA-LTA-OS picks on every gather in *parser* (no neural net)."""
-    from seismic_utils.sta_lta import pick_first_breaks
+def _sta_lta_cpu_count() -> int:
+    return max(1, int(os.cpu_count() or 1))
 
-    try:
-        from tqdm import tqdm
-    except ImportError:
-        tqdm = lambda x, **k: x  # noqa: E731
 
-    origin_id_map: Dict[str, int] = {}
-    dt_by_origin: Dict[str, float] = {}
-    chunks: List[pd.DataFrame] = []
+def _sta_lta_mp_context():
+    # Fork avoids re-importing torch in each worker. Spawn is required on
+    # Windows/macOS; fbp_eval's ``if __name__ == "__main__"`` guard covers that.
+    if sys.platform.startswith("linux"):
+        return mp.get_context("fork")
+    return mp.get_context("spawn")
 
-    for i in tqdm(range(len(parser)), desc="sta-lta"):
-        item = parser[i]
-        origin = str(item.get("origin") or item.get("site_name") or "unknown")
-        if origin not in origin_id_map:
-            origin_id_map[origin] = len(origin_id_map)
-        dt_ms = sample_rate_ms_from_item(item)
-        dt_by_origin.setdefault(origin, dt_ms)
 
-        samples = np.asarray(item["samples"], dtype=np.float64)
-        if samples.ndim != 2:
-            raise ValueError(f"gather {i}: samples must be 2D, got {samples.shape}")
-        n_tr = int(samples.shape[0])
-        rec_ids = np.asarray(item["rec_ids"]).reshape(-1)
-        if rec_ids.shape[0] != n_tr:
-            rec_ids = np.arange(n_tr, dtype=np.int64)
-        good = rec_ids != -1
-        offsets_raw = item.get("offset_distances")
-        if offsets_raw is not None:
-            offsets = np.asarray(offsets_raw, dtype=np.float64).reshape(n_tr, -1)[:, 0]
-        else:
-            offsets = np.full(n_tr, np.nan, dtype=np.float64)
-        target = np.asarray(item["first_break_labels"], dtype=np.float64).reshape(-1)
-        if target.shape[0] != n_tr:
-            target = np.resize(target, n_tr)
+def _sta_lta_payload_from_item(item: Dict[str, Any], opts) -> Dict[str, Any]:
+    samples = np.asarray(item["samples"], dtype=np.float64)
+    if samples.ndim != 2:
+        raise ValueError(f"samples must be 2D, got {samples.shape}")
+    n_tr = int(samples.shape[0])
+    rec_ids = np.asarray(item["rec_ids"]).reshape(-1)
+    if rec_ids.shape[0] != n_tr:
+        rec_ids = np.arange(n_tr, dtype=np.int64)
+    offsets_raw = item.get("offset_distances")
+    if offsets_raw is not None:
+        offsets = np.asarray(offsets_raw, dtype=np.float64).reshape(n_tr, -1)[:, 0]
+    else:
+        offsets = np.full(n_tr, np.nan, dtype=np.float64)
+    target = np.asarray(item["first_break_labels"], dtype=np.float64).reshape(-1)
+    if target.shape[0] != n_tr:
+        target = np.resize(target, n_tr)
+    return {
+        "origin": str(item.get("origin") or item.get("site_name") or "unknown"),
+        "dt_ms": sample_rate_ms_from_item(item),
+        "samples": samples,
+        "rec_ids": rec_ids,
+        "offsets": offsets,
+        "target": target,
+        "gather_id": int(item["gather_id"]),
+        "shot_id": int(item["shot_id"]),
+        "opts": opts,
+    }
 
-        pred, qual = pick_first_breaks(
-            samples,
-            1000.0 / max(dt_ms, 1e-12),
-            opts,
-            return_quality=True,
-        )
-        pred_int = np.zeros(n_tr, dtype=np.int64)
-        finite = np.isfinite(pred) & (pred > 0)
-        pred_int[finite] = np.rint(pred[finite]).astype(np.int64)
-        valid_tgt = target > 0
-        errors = np.where(valid_tgt, pred_int.astype(np.float64) - target, np.nan)
 
-        idx = np.flatnonzero(good)
-        if idx.size == 0:
-            continue
-        chunks.append(
-            pd.DataFrame(
-                {
-                    "GatherId": np.full(idx.size, int(item["gather_id"]), dtype=np.int64),
-                    "ShotId": np.full(idx.size, int(item["shot_id"]), dtype=np.int64),
-                    "ReceiverId": rec_ids[idx].astype(np.int64, copy=False),
-                    "OriginId": np.full(idx.size, origin_id_map[origin], dtype=np.int64),
-                    "Offset": offsets[idx],
-                    "Predictions": pred_int[idx],
-                    "Probabilities": qual[idx],
-                    "GatherCoverage": pred_int[idx] > 0,
-                    "ExpectedCoverage": np.ones(idx.size, dtype=bool),
-                    "Errors": errors[idx],
-                }
-            )
-        )
-
-    traces = pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame(
+def _sta_lta_empty_frame() -> pd.DataFrame:
+    return pd.DataFrame(
         {
             "GatherId": pd.Series(dtype="int"),
             "ShotId": pd.Series(dtype="int"),
@@ -404,6 +405,87 @@ def run_sta_lta_eval(parser, opts) -> tuple[pd.DataFrame, Dict[str, int], Dict[s
             "Errors": pd.Series(dtype="float"),
         }
     )
+
+
+def _sta_lta_row_frame(result: Dict[str, Any], origin_id: int) -> Optional[pd.DataFrame]:
+    rec = np.asarray(result["receiver_id"])
+    if rec.size == 0:
+        return None
+    pred = np.asarray(result["predictions"])
+    n = rec.size
+    return pd.DataFrame(
+        {
+            "GatherId": np.full(n, int(result["gather_id"]), dtype=np.int64),
+            "ShotId": np.full(n, int(result["shot_id"]), dtype=np.int64),
+            "ReceiverId": rec.astype(np.int64, copy=False),
+            "OriginId": np.full(n, origin_id, dtype=np.int64),
+            "Offset": np.asarray(result["offset"], dtype=np.float64),
+            "Predictions": pred.astype(np.int64, copy=False),
+            "Probabilities": np.asarray(result["probabilities"], dtype=np.float64),
+            "GatherCoverage": pred > 0,
+            "ExpectedCoverage": np.ones(n, dtype=bool),
+            "Errors": np.asarray(result["errors"], dtype=np.float64),
+        }
+    )
+
+
+def run_sta_lta_eval(
+    parser,
+    opts,
+    *,
+    num_workers: Optional[int] = None,
+) -> tuple[pd.DataFrame, Dict[str, int], Dict[str, float]]:
+    """Score STA-LTA-OS picks on every gather in *parser* (no neural net).
+
+    Picking runs in a spawn process pool sized to the CPU count. Gather loads
+    stay in this process (HDF5 / parser handles are not sent to workers).
+    """
+    from seismic_utils.sta_lta import mp_worker_init, score_eval_gather
+
+    try:
+        from tqdm import tqdm
+    except ImportError:
+        tqdm = lambda x, **k: x  # noqa: E731
+
+    n_gathers = len(parser)
+    n_workers = num_workers if num_workers is not None else _sta_lta_cpu_count()
+    n_workers = max(1, min(int(n_workers), n_gathers or 1))
+
+    def payloads() -> Iterator[Dict[str, Any]]:
+        for i in range(n_gathers):
+            yield _sta_lta_payload_from_item(parser[i], opts)
+
+    origin_id_map: Dict[str, int] = {}
+    dt_by_origin: Dict[str, float] = {}
+    chunks: List[pd.DataFrame] = []
+    pool = None
+    if n_gathers == 0:
+        return _sta_lta_empty_frame(), origin_id_map, dt_by_origin
+
+    try:
+        if n_workers <= 1:
+            mapped = map(score_eval_gather, payloads())
+        else:
+            ctx = _sta_lta_mp_context()
+            pool = ctx.Pool(
+                processes=n_workers,
+                initializer=mp_worker_init,
+            )
+            mapped = pool.imap(score_eval_gather, payloads(), chunksize=1)
+        for result in tqdm(mapped, total=n_gathers, desc=f"sta-lta[{n_workers}w]"):
+            origin = str(result["origin"])
+            if origin not in origin_id_map:
+                origin_id_map[origin] = len(origin_id_map)
+            dt_by_origin.setdefault(origin, float(result["dt_ms"]))
+            frame = _sta_lta_row_frame(result, origin_id_map[origin])
+            if frame is not None:
+                chunks.append(frame)
+    finally:
+        if pool is not None:
+            pool.close()
+            pool.join()
+
+    traces = pd.concat(chunks, ignore_index=True) if chunks else _sta_lta_empty_frame()
     return traces, origin_id_map, dt_by_origin
 
 
@@ -477,35 +559,39 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    if args.picker == "fbpunet":
+    resolved_picker = args.picker
+    if resolved_picker in NN_PICKERS:
         print("PL compat:", ensure_hardpicks_lightning_compat())
     if not hardpicks_available():
         raise SystemExit("hardpicks (+ torch) required — run setup_lightning.sh / install requirements")
 
     site_label, site_names, eval_ratio = resolve_eval_sites(args)
     npz_root = args.npz_root or (args.data_dir / "npz")
-    parser = train_cli.build_split_parser(
-        site_names,
-        prefix="valid",
-        backend=args.backend,
-        data_dir=args.data_dir,
-        npz_root=npz_root,
-        eval_ratio=eval_ratio,
-        augment=False,
-        use_eval_split=bool(eval_ratio),
-    )
 
     ckpt: Optional[Path] = None
     config_path: Optional[Path] = None
-    encoder = "sta-lta" if args.picker == "sta-lta" else "model"
+    encoder = "sta-lta" if resolved_picker == PICKER_STA_LTA else "model"
 
-    if args.picker == "sta-lta":
+    if resolved_picker == PICKER_STA_LTA:
+        parser = train_cli.build_split_parser(
+            site_names,
+            prefix="valid",
+            backend=args.backend,
+            data_dir=args.data_dir,
+            npz_root=npz_root,
+            eval_ratio=eval_ratio,
+            augment=False,
+            use_eval_split=bool(eval_ratio),
+        )
         sta_opts = _sta_lta_options_from_args(args)
+        n_sta_workers = min(_sta_lta_cpu_count(), max(len(parser), 1))
         print(
             f"Picker: STA-LTA-OS (Th={sta_opts.th}, Lw={sta_opts.lw_s}s, Sw={sta_opts.sw_s}s)\n"
-            f"Eval sites: {site_names}  gathers={len(parser)}"
+            f"Workers: {n_sta_workers}  Eval sites: {site_names}  gathers={len(parser)}"
         )
-        traces_raw, origin_id_map, dt_by_origin = run_sta_lta_eval(parser, sta_opts)
+        traces_raw, origin_id_map, dt_by_origin = run_sta_lta_eval(
+            parser, sta_opts, num_workers=n_sta_workers
+        )
         traces = annotate_trace_frame(
             traces_raw,
             origin_id_map=origin_id_map,
@@ -513,10 +599,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
         metrics = headline_metrics(traces)
         metrics["loss"] = None
-        metrics["picker"] = "sta-lta"
+        metrics["picker"] = PICKER_STA_LTA
         metrics["sta_lta"] = {"th": sta_opts.th, "lw_s": sta_opts.lw_s, "sw_s": sta_opts.sw_s}
     else:
-        import hardpicks.metrics.fbp.evaluator as fbp_eval
         import hardpicks.data.fbp.data_module as fbp_data_module
         import torch.utils.data
 
@@ -538,13 +623,36 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         hp = dict(getattr(model, "hparams", {}) or {})
         if file_cfg:
             hp = {**file_cfg, **hp}
+        ckpt_picker = picker_from_hparams(hp)
+        resolved_picker, mismatched = reconcile_cli_picker(args.picker, ckpt_picker)
+        if mismatched:
+            logger.warning(
+                "checkpoint picker=%s disagrees with --picker %s; using checkpoint",
+                ckpt_picker,
+                args.picker,
+            )
+        picker_spec = spec_for(resolved_picker)
+        if args.smooth_threshold is not None:
+            hp["segm_first_break_smooth_threshold"] = int(args.smooth_threshold)
         hp["eval_metrics"] = merge_eval_metrics(hp.get("eval_metrics"))
-        hp["segm_class_count"] = hp.get("segm_class_count") or getattr(model, "segm_class_count", 1)
+        hp["segm_class_count"] = picker_spec.segm_class_count or getattr(model, "segm_class_count", 1)
+        hp["picker"] = resolved_picker
         hp["segm_first_break_prob_threshold"] = hp.get(
             "segm_first_break_prob_threshold",
             getattr(model, "segm_first_break_prob_threshold", 0.0),
         )
-        evaluator = fbp_eval.FBPEvaluator(hp)
+        parser = train_cli.build_split_parser(
+            site_names,
+            prefix="valid",
+            backend=args.backend,
+            data_dir=args.data_dir,
+            npz_root=npz_root,
+            eval_ratio=eval_ratio,
+            augment=False,
+            use_eval_split=bool(eval_ratio),
+            segm_class_count=int(hp["segm_class_count"]),
+        )
+        evaluator = make_eval_evaluator(hp, resolved_picker)
         collate_fn = functools.partial(
             fbp_data_module.fbp_batch_collate,
             pad_to_nearest_pow2=True,
@@ -563,6 +671,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             **worker_kwargs,
         )
         print(
+            f"Picker: {resolved_picker}\n"
             f"Checkpoint: {ckpt}\n"
             f"Config: {config_path}\n"
             f"Eval sites: {site_names}  gathers={len(parser)}  batches={len(loader)}\n"
@@ -577,11 +686,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
         metrics = headline_metrics(traces)
         metrics["loss"] = mean_loss
-        metrics["picker"] = "fbpunet"
+        metrics["picker"] = resolved_picker
+        if resolved_picker == PICKER_BEFORE_AFTER:
+            metrics["smooth_threshold"] = hp.get("segm_first_break_smooth_threshold")
         metrics["evaluator"] = {
             str(k): (float(v) if np.isfinite(float(v)) else None) for k, v in evaluator_summary.items()
         }
-        encoder = hp.get("unet_encoder_type") or "model"
+        encoder = str(hp.get("unet_encoder_type") or "model")
+        if resolved_picker == PICKER_BEFORE_AFTER and "horizon" not in encoder.lower():
+            encoder = f"{encoder}-horizon"
     offset_df = offset_bin_table(traces)
     gather_df = gather_summary(traces)
     worst_df, typical_df = pick_gallery_gathers(
@@ -628,13 +741,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     write_worst_html(typical_cards, report_dir / "typical.html", title="Typical gathers")
     meta = {
         "run_name": run_name,
-        "picker": args.picker,
+        "picker": resolved_picker,
         "checkpoint": str(ckpt) if ckpt is not None else "—",
         "model_config": str(config_path) if config_path else "",
         "encoder": encoder,
         "sites": list(site_names),
         "fold": site_label if args.fold else None,
         "backend": args.backend,
+        "smooth_threshold": metrics.get("smooth_threshold"),
     }
     write_report_md(
         report_dir / "report.md",

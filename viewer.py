@@ -16,7 +16,16 @@ from seismic_utils.dataset import (
     list_dataset_files,
     load_line_gather,
 )
+from seismic_utils.fb_smooth import DEFAULT_SMOOTH_THRESHOLD
 from seismic_utils.hardpicks_bridge import HardpicksGatherStore, hardpicks_available
+from seismic_utils.pickers import (
+    ALL_PICKERS,
+    PICKER_BEFORE_AFTER,
+    PICKER_STA_LTA,
+    normalize_picker as _registry_normalize_picker,
+    picker_from_model,
+    smooth_threshold_from_hparams,
+)
 from seismic_utils.plotting import plot_shot_gather
 from seismic_utils.sites import SiteConfig, resolve_site_config
 
@@ -104,7 +113,7 @@ def _parse_gather_id(choice: str) -> int:
     return int(choice.split(":", 1)[0].strip())
 
 
-PICKER_MODES = ("fbpunet", "sta-lta")
+PICKER_MODES = ALL_PICKERS
 
 
 def _normalize_pick_display(pick_display: str) -> str:
@@ -115,14 +124,19 @@ def _normalize_pick_display(pick_display: str) -> str:
 
 
 def _normalize_picker(picker: str) -> str:
-    mode = (picker or "fbpunet").strip().lower().replace("_", "-")
-    if mode in {"unet", "model", "ckpt", "checkpoint"}:
-        mode = "fbpunet"
-    if mode in {"stalta", "sta/lta", "sta-lta-os"}:
-        mode = "sta-lta"
-    if mode not in PICKER_MODES:
-        raise gr.Error(f"Unknown picker: {picker!r}")
-    return mode
+    try:
+        return _registry_normalize_picker(picker)
+    except ValueError as exc:
+        raise gr.Error(str(exc)) from exc
+
+
+def _smooth_threshold_from_ui(value) -> int:
+    if value is None:
+        return DEFAULT_SMOOTH_THRESHOLD
+    try:
+        return max(int(value), 1)
+    except (TypeError, ValueError):
+        return DEFAULT_SMOOTH_THRESHOLD
 
 
 def _sta_lta_options_from_ui(th: float | None, lw_s: float | None, sw_s: float | None):
@@ -153,6 +167,7 @@ def load_model(ckpt_path: str):
 
     key = str(resolved)
     if _MODEL_CACHE["path"] == key and _MODEL_CACHE["model"] is not None:
+        model = _MODEL_CACHE["model"]
         status = f"Model already loaded: {resolved.name}"
     else:
         try:
@@ -166,7 +181,16 @@ def load_model(ckpt_path: str):
             f"Loaded {resolved} | {n_params / 1e6:.1f}M params | "
             f"device={next(model.parameters()).device}"
         )
-    return str(resolved), status
+    detected = picker_from_model(model)
+    hp = dict(getattr(model, "hparams", {}) or {})
+    thr = smooth_threshold_from_hparams(hp)
+    status = f"{status} | picker={detected}"
+    return (
+        str(resolved),
+        status,
+        gr.update(value=detected),
+        gr.update(value=thr),
+    )
 
 
 def _get_loaded_model():
@@ -183,9 +207,10 @@ def _predict_for_gather(
     *,
     picker: str = "fbpunet",
     sta_lta_opts=None,
+    smooth_threshold: int | None = None,
 ) -> np.ndarray:
     picker = _normalize_picker(picker)
-    if picker == "sta-lta":
+    if picker == PICKER_STA_LTA:
         from seismic_utils.sta_lta import pick_first_breaks_ms_from_shot_gather
 
         if gather is None:
@@ -204,7 +229,9 @@ def _predict_for_gather(
     # Prefer the already-loaded native gather — avoids opening hardpicks TraceParser
     # (multi-minute hang on large HDF5 sites like Brunswick).
     if gather is not None:
-        return predict_first_breaks_ms_from_shot_gather(model, gather)
+        return predict_first_breaks_ms_from_shot_gather(
+            model, gather, picker=picker, smooth_threshold=smooth_threshold
+        )
     if store is None:
         raise gr.Error(
             "Prediction requires a loaded gather or hardpicks (+ torch). "
@@ -214,7 +241,9 @@ def _predict_for_gather(
         raw = store.load_raw_by_shot_line(ref.shot_id, ref.line_id)
     except Exception as exc:  # noqa: BLE001
         raise gr.Error(f"Failed to open gather for prediction: {exc}") from exc
-    return predict_first_breaks_ms(model, raw)
+    return predict_first_breaks_ms(
+        model, raw, picker=picker, smooth_threshold=smooth_threshold
+    )
 
 
 def load_dataset(
@@ -226,6 +255,7 @@ def load_dataset(
     sta_lta_th: float | None = 1.3,
     sta_lta_lw: float | None = 0.5,
     sta_lta_sw: float | None = 0.05,
+    smooth_threshold: float | None = DEFAULT_SMOOTH_THRESHOLD,
     force_reload: bool = False,
 ):
     path = Path(file_path).expanduser()
@@ -257,14 +287,20 @@ def load_dataset(
         sta_lta_th=sta_lta_th,
         sta_lta_lw=sta_lta_lw,
         sta_lta_sw=sta_lta_sw,
+        smooth_threshold=smooth_threshold,
     )
     backend = "hardpicks" if _prefer_hardpicks_loads() and store is not None else "native"
     model_note = ""
     picker_mode = _normalize_picker(picker)
-    if picker_mode == "sta-lta":
+    if picker_mode == PICKER_STA_LTA:
         model_note = " | picker=STA-LTA-OS"
-    elif _MODEL_CACHE["path"]:
-        model_note = f" | model={Path(_MODEL_CACHE['path']).name}"
+    else:
+        bits = [f"picker={picker_mode}"]
+        if picker_mode == PICKER_BEFORE_AFTER:
+            bits.append(f"smooth={_smooth_threshold_from_ui(smooth_threshold)}")
+        if _MODEL_CACHE["path"]:
+            bits.append(f"model={Path(_MODEL_CACHE['path']).name}")
+        model_note = " | " + " | ".join(bits)
     cache_note = "cache hit" if was_cached else "indexed"
     status = (
         f"Loaded {path.name} ({site.site_name}): {len(index)} line gathers | "
@@ -289,6 +325,7 @@ def plot_selected(
     sta_lta_th: float | None = 1.3,
     sta_lta_lw: float | None = 0.5,
     sta_lta_sw: float | None = 0.05,
+    smooth_threshold: float | None = DEFAULT_SMOOTH_THRESHOLD,
 ):
     if not file_path or not gather_choice:
         raise gr.Error("Select a dataset file and a line gather.")
@@ -319,6 +356,7 @@ def plot_selected(
             gather=gather,
             picker=picker_mode,
             sta_lta_opts=_sta_lta_options_from_ui(sta_lta_th, sta_lta_lw, sta_lta_sw),
+            smooth_threshold=_smooth_threshold_from_ui(smooth_threshold),
         )
 
     return plot_shot_gather(
@@ -337,10 +375,11 @@ def build_app() -> gr.Blocks:
             "2D images are **shot × receiver-line** gathers. "
             "Browsing uses the **native** index/loader by default (fast). "
             "Set `SEISMIC_BACKEND=hardpicks` for official hardpicks loads (slower open).\n\n"
-            "**Prediction mode:** choose **FBPUNet** (load a training `best*.ckpt`) or **STA-LTA-OS** "
-            "(Jones & van der Baan adaptive picker, no checkpoint). Then switch picks between "
-            "reference labels, predictions (lime), or both. Neural-net predictions run on the "
-            "already-loaded gather (no full hardpicks HDF5 open)."
+            "**Prediction mode:** choose **fbpunet** (FB-pixel UNet), **before_after** "
+            "(horizon / before-vs-after UNet), or **STA-LTA-OS** (no checkpoint). "
+            "Load a training `best*.ckpt` for the neural pickers — the radio switches to match "
+            "the checkpoint. Then switch picks between reference labels, predictions (lime), or both. "
+            "Neural-net predictions run on the already-loaded gather (no full hardpicks HDF5 open)."
         )
 
         with gr.Row():
@@ -364,13 +403,13 @@ def build_app() -> gr.Blocks:
                 label="Pick display",
                 choices=["reference", "prediction", "both"],
                 value="reference",
-                info="Prediction/both: load a checkpoint (FBPUNet) or use the STA-LTA picker.",
+                info="Prediction/both: load a checkpoint, or use STA-LTA (no ckpt).",
             )
             picker = gr.Radio(
                 label="Picker",
-                choices=["fbpunet", "sta-lta"],
+                choices=list(PICKER_MODES),
                 value="fbpunet",
-                info="sta-lta is Jones & van der Baan adaptive STA-LTA (no checkpoint).",
+                info="before_after uses the horizon smoother; sta-lta needs no checkpoint.",
             )
 
         with gr.Accordion("Prediction model", open=False):
@@ -382,6 +421,14 @@ def build_app() -> gr.Blocks:
                 )
                 load_model_btn = gr.Button("Load model", scale=1)
             model_status = gr.Textbox(label="Model status", interactive=False)
+            smooth_threshold = gr.Number(
+                label="Horizon smooth threshold (samples)",
+                value=DEFAULT_SMOOTH_THRESHOLD,
+                minimum=1,
+                maximum=500,
+                step=1,
+                info="before_after picker: skip isolated after-class pixels until this many samples agree.",
+            )
 
         with gr.Accordion("STA-LTA-OS", open=False):
             gr.Markdown(
@@ -408,6 +455,7 @@ def build_app() -> gr.Blocks:
             sta_lta_th,
             sta_lta_lw,
             sta_lta_sw,
+            smooth_threshold,
         ]
         load_inputs = [
             file_path,
@@ -418,6 +466,7 @@ def build_app() -> gr.Blocks:
             sta_lta_th,
             sta_lta_lw,
             sta_lta_sw,
+            smooth_threshold,
         ]
 
         load_btn.click(
@@ -428,7 +477,7 @@ def build_app() -> gr.Blocks:
         load_model_btn.click(
             fn=load_model,
             inputs=[ckpt_path],
-            outputs=[ckpt_path, model_status],
+            outputs=[ckpt_path, model_status, picker, smooth_threshold],
         ).then(
             fn=plot_selected,
             inputs=plot_inputs,
@@ -442,6 +491,7 @@ def build_app() -> gr.Blocks:
         sta_lta_th.change(fn=plot_selected, inputs=plot_inputs, outputs=[plot])
         sta_lta_lw.change(fn=plot_selected, inputs=plot_inputs, outputs=[plot])
         sta_lta_sw.change(fn=plot_selected, inputs=plot_inputs, outputs=[plot])
+        smooth_threshold.change(fn=plot_selected, inputs=plot_inputs, outputs=[plot])
 
     return demo
 
