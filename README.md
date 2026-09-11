@@ -50,6 +50,8 @@ with `SEISMIC_BACKEND=hardpicks`.
 - `seismic_utils/fbp_eval_report.py` — validation report (scalars, Plotly HTML, gather PNGs)
 - `models/` — local FBPUNet (cloned from hardpicks) used by `train/fbp_train.py`
 - `train/fbp_train.py` — training CLI (folds, multi-GPU, living `report/` log)
+- `TRAINING.md` — actual training pipeline (this repo)
+- `original_hardpicks.md` — paper / hardpicks search recipe
 - `train/fbp_eval.py` — checkpoint validation / prediction report CLI
 - `seismic_utils/export_npz.py` — per line-gather NPZ export
 - `seismic_utils/npz_parser.py` — fast hardpicks-compatible dataset from NPZ
@@ -101,22 +103,28 @@ See `train/fbp_train.py` or the notebook (`DATA_BACKEND = "npz"`).
 
 ## Training
 
-CLI script (recommended) — TensorBoard + CSV logs, step/epoch progress with loss and metrics:
+Full description of **this repo’s** trainer: [`TRAINING.md`](TRAINING.md)
+(data, folds, augs, loss, schedule, metrics). The paper / hardpicks search
+recipe is [`original_hardpicks.md`](original_hardpicks.md).
+
+CLI — TensorBoard + CSV logs, living report, best checkpoint on `valid/HitRate1px`.
+Defaults: **20** epochs, **16** gathers per GPU, early-stop patience **4**.
 
 ```bash
 conda activate seismic_activity   # or Lightning Studio kernel after setup_lightning.sh
-python train/fbp_train.py --sites Brunswick,Halfmile --backend npz --epochs 5
-python train/fbp_train.py --fold A --model resnet34 --epochs 15
+python train/fbp_train.py --fold A --model resnet34
+python train/fbp_train.py --fold A --patience 0          # no early stop
+python train/fbp_train.py --sites Brunswick,Halfmile --backend npz
 python train/fbp_train.py --list-models
 python train/fbp_train.py --list-folds
-python train/fbp_train.py --sites Brunswick --model efficientnet-b0 --epochs 5
 
 # watch metrics
-tensorboard --logdir output/train_brunswick_halfmile_resnet18/tensorboard
+tensorboard --logdir output/train_foldA_resnet34/tensorboard
 ```
 
-Useful flags: `--model` / `--model-config`, `--batch-size`, `--num-workers`, `--npz-root`,
-`--output-dir`, `--print-every-n-steps`, `--no-final-validate`.
+Useful flags: `--model` / `--model-config`, `--loss`, `--lr`,
+`--lr-step`, `--batch-size`, `--epochs`, `--patience`, `--num-workers`,
+`--npz-root`, `--output-dir`, `--encoder-weights`, `--no-final-validate`.
 
 Model presets (`--model`): `resnet18` (default), `resnet34`, `resnet50`, `efficientnet-b0`,
 `efficientnet-b4`, `vanilla`, or any SMP encoder name. Full hyperparam overrides via
@@ -148,7 +156,7 @@ Folds A–D are leave-one-site-out (3 train / 1 valid). Fold A matches hardpicks
 F–K match the hardpicks YAMLs that already omit Kevitsa (2 train / 1 valid).
 
 ```bash
-python train/fbp_train.py --fold A --model resnet34 --epochs 15
+python train/fbp_train.py --fold A --model resnet34
 python train/fbp_train.py --list-folds
 ```
 

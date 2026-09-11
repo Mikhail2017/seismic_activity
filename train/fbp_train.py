@@ -12,11 +12,12 @@ hyperparameter file. Optional SMP backbone pretraining via ``--encoder-weights``
 Example::
 
     conda activate seismic_activity
-    python train/fbp_train.py --sites Brunswick --model resnet18 --epochs 5
+    python train/fbp_train.py --sites Brunswick --model resnet18
     python train/fbp_train.py --sites Brunswick --model efficientnet-b0 \\
         --encoder-weights imagenet
     python train/fbp_train.py --sites Brunswick --model-config my_model.yaml
-    python train/fbp_train.py --fold A --model resnet18 --epochs 20
+    python train/fbp_train.py --fold A --model resnet18
+    python train/fbp_train.py --fold A --patience 0  # train all --epochs, no early stop
     python train/fbp_train.py --list-folds
     # live report: report/train_foldA_resnet18_YYYYMMDD_HHMMSS/report.md
 
@@ -155,6 +156,15 @@ TRAIN_AUGMENTATIONS = [
             "max_crop_fraction": 0.333,
         },
     },
+    {"type": "kill", "params": {"prob": 0.08}},
+    {
+        "type": "drop_and_pad",
+        "params": {
+            "target_trace_counts": [64, 128, 256, 512],
+            "full_snap": True,
+            "max_drop_ratio": 0.50,
+        },
+    },
     {"type": "flip"},
 ]
 
@@ -218,8 +228,24 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         default=None,
         help="NPZ root (default: <data-dir>/npz).",
     )
-    p.add_argument("--epochs", type=int, default=5, help="Max training epochs.")
-    p.add_argument("--batch-size", type=int, default=4, help="Per-GPU (per-device) batch size.")
+    p.add_argument(
+        "--epochs",
+        type=int,
+        default=20,
+        help="Max training epochs (early stopping may halt sooner).",
+    )
+    p.add_argument(
+        "--batch-size",
+        type=int,
+        default=16,
+        help="Per-GPU (per-device) batch size. Global batch is this times the GPU count.",
+    )
+    p.add_argument(
+        "--patience",
+        type=int,
+        default=4,
+        help="Early-stop patience on valid/HitRate1px (0 disables early stopping).",
+    )
     p.add_argument("--num-workers", type=int, default=2)
     p.add_argument(
         "--devices",
@@ -316,6 +342,19 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         type=float,
         default=None,
         help="Learning rate (default: preset-specific, else 0.002136).",
+    )
+    p.add_argument(
+        "--lr-step",
+        type=int,
+        default=None,
+        choices=(5, 10, 20),
+        help="StepLR step_size in epochs (default: 10). 20 with --epochs 20 is effectively constant LR.",
+    )
+    p.add_argument(
+        "--loss",
+        default=None,
+        choices=("crossentropy", "dice"),
+        help="Segmentation loss (default: crossentropy, or --model-config).",
     )
     p.add_argument("--seed", type=int, default=0)
     p.add_argument(
@@ -464,6 +503,8 @@ def build_model_config(
     lr: Optional[float] = None,
     model_config_path: Optional[Path] = None,
     encoder_weights: Optional[str] = None,
+    loss_type: Optional[str] = None,
+    lr_step: Optional[int] = None,
 ) -> tuple[Dict[str, Any], str]:
     """Build FBPUNet hyperparams from a preset and/or YAML/JSON override.
 
@@ -515,8 +556,12 @@ def build_model_config(
             {"metric_type": "HitRate", "metric_params": {"buffer_size_px": 1}},
             {"metric_type": "HitRate", "metric_params": {"buffer_size_px": 3}},
             {"metric_type": "HitRate", "metric_params": {"buffer_size_px": 5}},
+            {"metric_type": "HitRate", "metric_params": {"buffer_size_px": 7}},
+            {"metric_type": "HitRate", "metric_params": {"buffer_size_px": 9}},
             {"metric_type": "MeanBiasError"},
             {"metric_type": "MeanAbsoluteError"},
+            {"metric_type": "RootMeanSquaredError"},
+            {"metric_type": "GatherCoverage"},
         ],
         "gathers_to_display": 0,
         "use_checkpointing": False,
@@ -549,6 +594,15 @@ def build_model_config(
     if encoder_weights is not None:
         ew = encoder_weights.strip()
         base["encoder_weights"] = None if ew.lower() in {"", "none", "null"} else ew
+
+    if loss_type is not None:
+        base["loss_type"] = str(loss_type)
+    if lr_step is not None:
+        sched = dict(base.get("scheduler_params") or {})
+        sched["step_size"] = int(lr_step)
+        base["scheduler_params"] = sched
+    # Binary first-break vs not (ternary is not supported in this trainer).
+    base["segm_class_count"] = SEGMENTATION_CLASS_COUNT
 
     base["max_epochs"] = max_epochs
     base["model_type"] = base.get("model_type") or "FBPUNet"
@@ -614,6 +668,7 @@ def build_split_parser(
     eval_ratio: Optional[float],
     augment: bool,
     use_eval_split: bool,
+    segm_class_count: int = SEGMENTATION_CLASS_COUNT,
 ):
     """Build a concatenated parser for one split (train or valid)."""
     import hardpicks
@@ -637,7 +692,7 @@ def build_split_parser(
                         eval_ratio=eval_ratio,
                         use_eval_split=use_eval_split,
                     ),
-                    segm_class_count=SEGMENTATION_CLASS_COUNT,
+                    segm_class_count=segm_class_count,
                 )
             )
     elif backend == "hdf5":
@@ -674,7 +729,7 @@ def build_split_parser(
                     },
                     prefix=prefix,
                     dataset_hyper_params=generic_site_params,
-                    segm_class_count=SEGMENTATION_CLASS_COUNT,
+                    segm_class_count=segm_class_count,
                 )
             )
     else:
@@ -692,6 +747,7 @@ def build_parsers(
     data_dir: Path,
     npz_root: Path,
     eval_ratio: Optional[float],
+    segm_class_count: int = SEGMENTATION_CLASS_COUNT,
 ):
     train_parser = build_split_parser(
         train_site_names,
@@ -702,6 +758,7 @@ def build_parsers(
         eval_ratio=eval_ratio,
         augment=True,
         use_eval_split=False,
+        segm_class_count=segm_class_count,
     )
     valid_parser = build_split_parser(
         valid_site_names,
@@ -712,6 +769,7 @@ def build_parsers(
         eval_ratio=eval_ratio,
         augment=False,
         use_eval_split=True,
+        segm_class_count=segm_class_count,
     )
     logger.info(
         "Total train gathers: %d | Valid gathers: %d",
@@ -989,7 +1047,10 @@ class TrainingReport:
         lines.extend(
             [
                 f"**Epochs:** {meta.get('epochs', '')}",
+                f"**Early-stop patience:** {meta.get('patience', '')}",
                 f"**Batch size (per device):** {meta.get('batch_size', '')}",
+                f"**Loss:** {meta.get('loss', '')}",
+                f"**LR step:** {meta.get('lr_step', '')}",
                 f"**Devices:** {meta.get('num_devices', meta.get('devices', ''))}",
                 f"**Strategy:** {meta.get('strategy', '')}",
                 f"**Backend:** {meta.get('backend', '')}",
@@ -1466,6 +1527,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         lr=args.lr,
         model_config_path=args.model_config,
         encoder_weights=args.encoder_weights,
+        loss_type=args.loss,
+        lr_step=args.lr_step,
     )
     model_slug = "".join(c if c.isalnum() or c in "-_" else "-" for c in model_label.lower())
 
@@ -1500,7 +1563,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "valid_sites": list(valid_site_names),
                 "eval_ratio": eval_ratio,
                 "epochs": args.epochs,
+                "patience": args.patience,
                 "batch_size": args.batch_size,
+                "loss": model_config.get("loss_type"),
+                "lr_step": (model_config.get("scheduler_params") or {}).get("step_size"),
                 "backend": args.backend,
                 "output_dir": str(output_root),
                 "devices": args.devices,
@@ -1522,6 +1588,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print("Sites:", train_site_names, f"| eval_ratio={eval_ratio}")
     print("Model:", model_label, "| encoder:", model_config.get("unet_encoder_type"))
     print("encoder_weights:", model_config.get("encoder_weights"))
+    print(
+        "loss:",
+        model_config.get("loss_type"),
+        "| lr_step:",
+        (model_config.get("scheduler_params") or {}).get("step_size"),
+        "| patience:",
+        args.patience,
+    )
     print("DATA_BACKEND:", args.backend, "| NPZ_ROOT:", npz_root)
 
     config_out = output_root / "model_config.yaml"
@@ -1570,6 +1644,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         data_dir=args.data_dir,
         npz_root=npz_root,
         eval_ratio=eval_ratio,
+        segm_class_count=SEGMENTATION_CLASS_COUNT,
     )
     train_loader, valid_loader = build_loaders(
         train_parser,
@@ -1609,11 +1684,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         checkpoint_cb=checkpoint_cb,
     )
     lr_monitor = pl.callbacks.LearningRateMonitor(logging_interval="epoch")
+    callbacks: List[Any] = [checkpoint_cb, progress_cb, lr_monitor]
+    if args.patience > 0:
+        callbacks.append(
+            pl.callbacks.EarlyStopping(
+                monitor=MONITOR_METRIC,
+                mode="max",
+                patience=int(args.patience),
+                verbose=True,
+            )
+        )
 
     trainer = make_trainer(
         tbx_logger=tbx_logger,
         csv_logger=csv_logger,
-        callbacks=[checkpoint_cb, progress_cb, lr_monitor],
+        callbacks=callbacks,
         max_epochs=args.epochs,
         log_every_n_steps=args.log_every_n_steps,
         accelerator=args.accelerator,
@@ -1635,7 +1720,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print("batch keys:", sorted(_batch.keys()))
         print("samples", tuple(_batch["samples"].shape), _batch["samples"].dtype)
 
-    print(f"Training for {args.epochs} epochs…")
+    print(f"Training for up to {args.epochs} epochs (patience={args.patience})…")
     trainer.fit(model, train_loader, valid_loader)
 
     is_zero = bool(getattr(trainer, "is_global_zero", rank_zero))
