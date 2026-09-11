@@ -15,6 +15,8 @@ Example::
         --fold A --backend hdf5 --data-dir /tmp/data/
     python train/fbp_eval.py --ckpt output/train_foldA_resnet34/best-epoch=013-step=015232.ckpt \\
         --fold A --backend npz
+    python train/fbp_eval.py --picker before_after --ckpt-dir output/train_foldA_resnet34-before-after \\
+        --fold A --backend hdf5
 """
 
 from __future__ import annotations
@@ -53,8 +55,17 @@ from seismic_utils.fbp_eval_report import (
     write_trace_table,
     write_worst_html,
 )
+from seismic_utils.fb_smooth import DEFAULT_SMOOTH_THRESHOLD
 from seismic_utils.hardpicks_bridge import hardpicks_available, hardpicks_item_to_shot_gather
 from seismic_utils.hardpicks_pl_compat import ensure_hardpicks_lightning_compat
+from seismic_utils.pickers import (
+    PICKER_BEFORE_AFTER,
+    PICKER_FBPUNET,
+    make_eval_evaluator,
+    picker_from_hparams,
+    reconcile_cli_picker,
+    spec_for,
+)
 from seismic_utils.predict import load_fbp_model, resolve_checkpoint
 
 import fbp_train as train_cli
@@ -78,6 +89,15 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Validate an FBPUNet checkpoint and write a prediction report.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    p.add_argument(
+        "--picker",
+        choices=(PICKER_FBPUNET, PICKER_BEFORE_AFTER),
+        default=None,
+        help=(
+            "Decode head. Default: checkpoint hparams (picker / segm_class_count). "
+            "On mismatch the checkpoint wins."
+        ),
     )
     p.add_argument("--ckpt", type=Path, default=None, help="Path to a .ckpt file.")
     p.add_argument(
@@ -112,6 +132,15 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--n-worst", type=int, default=8, help="Worst gathers to plot.")
     p.add_argument("--n-typical", type=int, default=4, help="Typical/good gathers to plot.")
     p.add_argument("--report-dir", type=Path, default=None, help="Report root (default: <repo>/report).")
+    p.add_argument(
+        "--smooth-threshold",
+        type=int,
+        default=None,
+        help=(
+            "Before/after pick smoother window in samples "
+            f"(default: checkpoint hparams or {DEFAULT_SMOOTH_THRESHOLD})."
+        ),
+    )
     p.add_argument("-v", "--verbose", action="store_true")
     p.add_argument("--list-folds", action="store_true")
     args = p.parse_args(argv)
@@ -382,7 +411,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     site_label, site_names, eval_ratio = resolve_eval_sites(args)
     npz_root = args.npz_root or (args.data_dir / "npz")
 
-    import hardpicks.metrics.fbp.evaluator as fbp_eval
     import hardpicks.data.fbp.data_module as fbp_data_module
     import torch.utils.data
 
@@ -394,12 +422,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if file_cfg:
         hp = {**file_cfg, **hp}
     hp["eval_metrics"] = merge_eval_metrics(hp.get("eval_metrics"))
-    hp["segm_class_count"] = hp.get("segm_class_count") or getattr(model, "segm_class_count", 1)
+    ckpt_picker = picker_from_hparams(hp)
+    cli_picker = args.picker or ckpt_picker
+    resolved_picker, mismatched = reconcile_cli_picker(cli_picker, ckpt_picker)
+    if mismatched and args.picker:
+        logger.warning(
+            "checkpoint picker=%s disagrees with --picker %s; using checkpoint",
+            ckpt_picker,
+            args.picker,
+        )
+    picker_spec = spec_for(resolved_picker)
+    if args.smooth_threshold is not None:
+        hp["segm_first_break_smooth_threshold"] = int(args.smooth_threshold)
+    hp["segm_class_count"] = picker_spec.segm_class_count or getattr(model, "segm_class_count", 1)
+    hp["picker"] = resolved_picker
     hp["segm_first_break_prob_threshold"] = hp.get(
         "segm_first_break_prob_threshold",
         getattr(model, "segm_first_break_prob_threshold", 0.0),
     )
-    evaluator = fbp_eval.FBPEvaluator(hp)
+    evaluator = make_eval_evaluator(hp, resolved_picker)
 
     parser = train_cli.build_split_parser(
         site_names,
@@ -410,6 +451,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         eval_ratio=eval_ratio,
         augment=False,
         use_eval_split=bool(eval_ratio),
+        segm_class_count=int(hp["segm_class_count"]),
         first_break_prior=bool(getattr(model, "use_first_break_prior", False)),
     )
     collate_fn = functools.partial(
@@ -430,6 +472,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         **worker_kwargs,
     )
     print(
+        f"Picker: {resolved_picker}\n"
         f"Checkpoint: {ckpt}\n"
         f"Config: {config_path}\n"
         f"Eval sites: {site_names}  gathers={len(parser)}  batches={len(loader)}\n"
@@ -445,6 +488,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     metrics = headline_metrics(traces)
     metrics["loss"] = mean_loss
+    metrics["picker"] = resolved_picker
+    if resolved_picker == PICKER_BEFORE_AFTER:
+        metrics["smooth_threshold"] = hp.get("segm_first_break_smooth_threshold")
     metrics["evaluator"] = {
         str(k): (float(v) if np.isfinite(float(v)) else None) for k, v in evaluator_summary.items()
     }
@@ -454,7 +500,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         gather_df, n_worst=args.n_worst, n_typical=args.n_typical
     )
 
-    encoder = hp.get("unet_encoder_type") or "model"
+    encoder = str(hp.get("unet_encoder_type") or "model")
+    if resolved_picker == PICKER_BEFORE_AFTER and "before-after" not in encoder.lower():
+        encoder = f"{encoder}-before-after"
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_name = f"eval_{site_label}_{str(encoder).replace('/', '-')}"
     report_root = (args.report_dir or (REPO_ROOT / "report")).resolve()
@@ -495,12 +543,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     write_worst_html(typical_cards, report_dir / "typical.html", title="Typical gathers")
     meta = {
         "run_name": run_name,
+        "picker": resolved_picker,
         "checkpoint": str(ckpt),
         "model_config": str(config_path) if config_path else "",
         "encoder": encoder,
         "sites": list(site_names),
         "fold": site_label if args.fold else None,
         "backend": args.backend,
+        "smooth_threshold": metrics.get("smooth_threshold"),
     }
     write_report_md(
         report_dir / "report.md",
