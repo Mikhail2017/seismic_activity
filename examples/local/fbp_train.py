@@ -596,7 +596,9 @@ def _concat_or_single(parts: list):
 def _site_params(*, augment: bool, eval_ratio: Optional[float], use_eval_split: bool) -> Dict[str, Any]:
     params: Dict[str, Any] = dict(COMMON_SITE_PARAMS)
     if augment:
-        params["augmentations"] = TRAIN_AUGMENTATIONS
+        # ShotLineGatherPreprocessor mutates each aug dict (replaces type str with a
+        # callable). Copy so the 2nd+ training site does not see a spent config.
+        params["augmentations"] = copy.deepcopy(TRAIN_AUGMENTATIONS)
     if eval_ratio is not None:
         params["subset"] = {"eval_ratio": eval_ratio, "use_eval_split": use_eval_split}
     return params
