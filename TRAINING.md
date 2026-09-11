@@ -21,10 +21,12 @@ Checkpointing and early stopping both watch **`valid/HitRate1px`**. Live notes g
 `report/train_<label>_<model>_<YYYYMMDD_HHMMSS>/`. Weights, `model_config.yaml`, and a
 copy of the recipe go to `output/train_<label>_<model>/`.
 
-Loop / split / loss / LR defaults live in [`configs/train.yaml`](configs/train.yaml)
-(`--config`). CLI flags override the recipe. `--fold`, `--sites`, paths, GPUs, and
-`--ckpt` stay on the command line. Precedence for `loss` / `lr` / `lr_step` /
-`encoder_weights`: recipe YAML → `--model-config` → CLI.
+Loop / split / loss / LR / **augmentations** defaults live in
+[`configs/train.yaml`](configs/train.yaml) (`--config`). CLI flags override the
+recipe except augmentations, which are YAML-only (`[]` disables them). `--fold`,
+`--sites`, paths, GPUs, and `--ckpt` stay on the command line. Precedence for
+`loss` / `lr` / `lr_step` / `encoder_weights`: recipe YAML → `--model-config` →
+CLI.
 
 After fit, score the best checkpoint with [`train/fbp_eval.py`](train/fbp_eval.py)
 (same `--fold` or `--sites`).
@@ -84,16 +86,81 @@ Train and valid gather keys are asserted disjoint.
 
 ## Augmentations
 
-Applied on **train only**. Validation is never augmented.
+Applied on **train only**, in list order, **before** amplitude/offset
+normalization and before the segmentation mask is built. Validation is never
+augmented. Edit [`configs/train.yaml`](configs/train.yaml) (`augmentations:`).
+An empty list disables all augs.
 
-- **crop** — random time crop to 512 or 1024 samples (`max_crop_fraction=0.333`)
-- **kill** — each trace zeroed with probability **0.08**
-- **drop_and_pad** — resample line length to \(\{64, 128, 256, 512\}\) traces
-  (`full_snap=true`, `max_drop_ratio=0.50`)
-- **flip** — horizontal flip along the receiver axis
+Default order matches hardpicks fold A: `crop` → `kill` → `drop_and_pad` →
+`flip`.
 
-The collate function pads a minibatch to a common **power-of-two** size so the
-U-Net can stack gathers. Padded traces are marked invalid (`rec_ids == -1`).
+The collate function then pads a minibatch to a common **power-of-two** size so
+the U-Net can stack gathers. Collate padding is not an augmentation; padded
+traces are marked invalid (`rec_ids == -1`) and ignored by the metrics.
+
+### `crop`
+
+Shortens the **time** axis by cutting samples off the **end** of the gather
+(the start of the record is kept). This is not a sliding window.
+
+- If the gather already has `≤ low_sample_count` samples, it is left unchanged.
+- Otherwise a crop length is drawn so the remainder stays at least
+  `low_sample_count`, aims for `≤ high_sample_count` when possible, and never
+  removes more than `max_crop_fraction` of the samples.
+- First-break picks that fall past the new length are marked invalid; those
+  traces become don’t-care in the mask.
+
+Default: `low_sample_count=512`, `high_sample_count=1024`,
+`max_crop_fraction=0.333`.
+
+### `kill`
+
+Independently replaces a trace’s amplitudes with zeros with probability
+`prob`. Geometry, first-break labels, and offset channels are **not**
+changed. After abs-max normalization a killed trace stays ~0, but the pixel
+label at the annotated sample is still “first break”, so the model has to pick
+through dead traces.
+
+Default: `prob=0.08` (~8% of traces).
+
+### `drop_and_pad`
+
+Changes how many receivers are in the line gather so nearby examples share a
+few discrete widths (better batching, less overfitting to one line length).
+
+1. Choose the `target_trace_counts` value closest to the current trace count.
+2. If reaching it would **drop** more than `max_drop_ratio` of the traces,
+   switch to the next **larger** target and pad instead.
+3. **Drop** (gather too long): remove traces with bad picks first, then peel
+   from both edges. Neighbor distances of the remaining receivers are patched.
+4. **Pad** (gather too short): insert dummy traces on both ends (random split
+   of pre/post count). Dummy amplitudes are zeros; dummy offset channels are
+   filled with 0. First-break labels on dummy traces are invalid / don’t-care.
+5. `full_snap: true` always lands exactly on the target. `false` takes a
+   random step toward it.
+
+Default: targets `{64, 128, 256, 512}`, `full_snap=true`, `max_drop_ratio=0.50`.
+A gather that is still too long to drop 50% of the way to 512 will assert
+(hardpicks cannot pad past the largest target).
+
+### `flip`
+
+With probability **0.5**, reverse the gather along the **receiver** axis
+(left↔right). Amplitudes, pick labels, shot–receiver distance, and the two
+neighbor-distance channels are flipped together; the neighbor channels are
+swapped so “distance to left/right” stays consistent. No extra `params`.
+
+### Other types (not in the default recipe)
+
+Hardpicks also accepts these if you add them to the YAML list:
+
+| `type` | What it does |
+| --- | --- |
+| `resample_hardcoded` | Resample time by one notch among `{0.5, 1, 2, 4}` ms, clamped by sample-count limits |
+| `resample_nearby` | With probability `prob`, jitter the sample rate in a window around the current rate |
+| `noise` | With probability `prob`, overlay a band-limited noise patch |
+
+Do not enable any of these on the validation parser.
 
 ## Model
 

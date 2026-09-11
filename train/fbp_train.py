@@ -167,7 +167,8 @@ MODEL_ALIASES: Dict[str, str] = {
     "fbp-unet": "resnet18",
 }
 
-TRAIN_AUGMENTATIONS = [
+# Used only when the recipe omits ``augmentations`` (missing config file / old YAML).
+DEFAULT_TRAIN_AUGMENTATIONS: List[Dict[str, Any]] = [
     {
         "type": "crop",
         "params": {
@@ -244,6 +245,35 @@ def _trainer_defaults_from_recipe(recipe: Dict[str, Any]) -> Dict[str, Any]:
     return {key: recipe[key] for key in _RECIPE_TRAINER_KEYS if recipe.get(key) is not None}
 
 
+def resolve_train_augmentations(recipe: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Train-only augs from the recipe YAML.
+
+    Missing key → built-in default. ``null`` or ``[]`` disables augs. A mapping
+    (hardpicks-style named ops) is accepted and converted to a list.
+    """
+    if "augmentations" not in recipe:
+        return copy.deepcopy(DEFAULT_TRAIN_AUGMENTATIONS)
+    raw = recipe["augmentations"]
+    if raw is None:
+        return []
+    if isinstance(raw, dict):
+        raw = list(raw.values())
+    if not isinstance(raw, list):
+        raise SystemExit("train config 'augmentations' must be a list, mapping, or null")
+    ops: List[Dict[str, Any]] = []
+    for i, item in enumerate(raw):
+        if not isinstance(item, dict) or not item.get("type"):
+            raise SystemExit(
+                f"train config augmentations[{i}] must be a mapping with a 'type' key"
+            )
+        ops.append(copy.deepcopy(item))
+    return ops
+
+
+def _aug_type_names(augmentations: Sequence[Dict[str, Any]]) -> List[str]:
+    return [str(op.get("type", "?")) for op in augmentations]
+
+
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     argv_list = _argv_list(argv)
     preset_names = ", ".join(sorted(MODEL_PRESETS))
@@ -252,7 +282,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--config",
         type=Path,
         default=DEFAULT_TRAIN_CONFIG,
-        help="Training recipe YAML (loop, split, model name, loss/LR). CLI flags override it.",
+        help="Training recipe YAML (loop, split, model, loss/LR, augmentations). CLI flags override it.",
     )
     pre_args, _ = pre.parse_known_args(argv_list)
     recipe, config_path = load_train_recipe(
@@ -460,6 +490,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     args = p.parse_args(argv_list)
     args.train_recipe = recipe
     args.train_config_path = config_path
+    args.train_augmentations = resolve_train_augmentations(recipe)
     return args
 
 
@@ -758,12 +789,25 @@ def _concat_or_single(parts: list):
     return ShotLineGatherConcatDataset(parts)
 
 
-def _site_params(*, augment: bool, eval_ratio: Optional[float], use_eval_split: bool) -> Dict[str, Any]:
+def _site_params(
+    *,
+    augment: bool,
+    eval_ratio: Optional[float],
+    use_eval_split: bool,
+    augmentations: Optional[Sequence[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
     params: Dict[str, Any] = dict(COMMON_SITE_PARAMS)
     if augment:
-        # ShotLineGatherPreprocessor mutates each aug dict (replaces type str with a
-        # callable). Copy so the 2nd+ training site does not see a spent config.
-        params["augmentations"] = copy.deepcopy(TRAIN_AUGMENTATIONS)
+        ops = (
+            list(augmentations)
+            if augmentations is not None
+            else DEFAULT_TRAIN_AUGMENTATIONS
+        )
+        if ops:
+            # ShotLineGatherPreprocessor mutates each aug dict (replaces type str
+            # with a callable). Copy so the 2nd+ training site does not see a
+            # spent config.
+            params["augmentations"] = copy.deepcopy(ops)
     if eval_ratio is not None:
         params["subset"] = {"eval_ratio": eval_ratio, "use_eval_split": use_eval_split}
     return params
@@ -780,6 +824,7 @@ def build_split_parser(
     augment: bool,
     use_eval_split: bool,
     segm_class_count: int = SEGMENTATION_CLASS_COUNT,
+    augmentations: Optional[Sequence[Dict[str, Any]]] = None,
 ):
     """Build a concatenated parser for one split (train or valid)."""
     import hardpicks
@@ -802,6 +847,7 @@ def build_split_parser(
                         augment=augment,
                         eval_ratio=eval_ratio,
                         use_eval_split=use_eval_split,
+                        augmentations=augmentations,
                     ),
                     segm_class_count=segm_class_count,
                 )
@@ -836,6 +882,7 @@ def build_split_parser(
                             augment=augment,
                             eval_ratio=eval_ratio,
                             use_eval_split=use_eval_split,
+                            augmentations=augmentations,
                         ),
                     },
                     prefix=prefix,
@@ -859,6 +906,7 @@ def build_parsers(
     npz_root: Path,
     eval_ratio: Optional[float],
     segm_class_count: int = SEGMENTATION_CLASS_COUNT,
+    augmentations: Optional[Sequence[Dict[str, Any]]] = None,
 ):
     train_parser = build_split_parser(
         train_site_names,
@@ -870,6 +918,7 @@ def build_parsers(
         augment=True,
         use_eval_split=False,
         segm_class_count=segm_class_count,
+        augmentations=augmentations,
     )
     valid_parser = build_split_parser(
         valid_site_names,
@@ -1164,6 +1213,7 @@ class TrainingReport:
                 f"**Batch size (per device):** {meta.get('batch_size', '')}",
                 f"**Loss:** {meta.get('loss', '')}",
                 f"**LR step:** {meta.get('lr_step', '')}",
+                f"**Augmentations:** {', '.join(meta.get('augmentations') or []) or 'none'}",
                 f"**Devices:** {meta.get('num_devices', meta.get('devices', ''))}",
                 f"**Strategy:** {meta.get('strategy', '')}",
                 f"**Backend:** {meta.get('backend', '')}",
@@ -1719,6 +1769,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "batch_size": args.batch_size,
                 "loss": model_config.get("loss_type"),
                 "lr_step": (model_config.get("scheduler_params") or {}).get("step_size"),
+                "augmentations": _aug_type_names(
+                    getattr(args, "train_augmentations", None) or []
+                ),
                 "resume_ckpt": str(resume_ckpt) if resume_ckpt else None,
                 "backend": args.backend,
                 "output_dir": str(output_root),
@@ -1750,6 +1803,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "| patience:",
         args.patience,
     )
+    augs = getattr(args, "train_augmentations", None) or []
+    print("augmentations:", ", ".join(_aug_type_names(augs)) or "none")
     if resume_ckpt is not None:
         print("Resume:", resume_ckpt)
     print("Train config:", getattr(args, "train_config_path", DEFAULT_TRAIN_CONFIG))
@@ -1766,6 +1821,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             {
                 "source": str(getattr(args, "train_config_path", "")),
                 **dict(getattr(args, "train_recipe", None) or {}),
+                "augmentations": getattr(args, "train_augmentations", None) or [],
             },
             f,
             sort_keys=False,
@@ -1815,6 +1871,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         npz_root=npz_root,
         eval_ratio=eval_ratio,
         segm_class_count=SEGMENTATION_CLASS_COUNT,
+        augmentations=getattr(args, "train_augmentations", None),
     )
     train_loader, valid_loader = build_loaders(
         train_parser,

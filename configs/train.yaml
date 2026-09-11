@@ -4,6 +4,7 @@
 # Precedence for model knobs (loss, lr, lr_step, encoder_weights):
 #   this file → --model-config → CLI
 #
+# Train augmentations live here (not CLI). Validation is never augmented.
 # fold / sites / data-dir / devices / ckpt stay on the command line.
 
 seed: 0
@@ -25,3 +26,21 @@ encoder_weights: null        # e.g. imagenet
 loss: crossentropy           # crossentropy | dice
 lr: null                     # null = preset LR for --model
 lr_step: 10                  # StepLR step_size; 5 | 10 | 20
+
+# Train-only, applied in this order. Validation is never augmented.
+# [] disables all augs. See TRAINING.md for what each type does.
+augmentations:
+  - type: crop              # keep the start of the gather; drop samples from the end
+    params:
+      low_sample_count: 512   # never crop below this many samples
+      high_sample_count: 1024 # try to land at or below this many samples
+      max_crop_fraction: 0.333
+  - type: kill              # independently zero each trace (labels kept)
+    params:
+      prob: 0.08
+  - type: drop_and_pad      # snap receiver-line length to a target (drop or dummy-pad)
+    params:
+      target_trace_counts: [64, 128, 256, 512]
+      full_snap: true         # always hit the target (false = random step toward it)
+      max_drop_ratio: 0.50    # if dropping more than this, pad up to the next target
+  - type: flip              # 50% chance: reverse traces along the receiver axis
