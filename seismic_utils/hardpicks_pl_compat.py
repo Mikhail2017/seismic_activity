@@ -17,11 +17,13 @@ _COMPAT_VERSION = 2  # bump when patch behavior changes
 
 
 def _patch_numpy_nan_alias() -> None:
-    """hardpicks uses ``np.NaN``, removed in NumPy 2."""
+    """Restore NumPy 1.x aliases that hardpicks still uses (removed in NumPy 2)."""
     import numpy as np
 
     if not hasattr(np, "NaN"):
         np.NaN = np.nan  # type: ignore[attr-defined]
+    if not hasattr(np, "bool8"):
+        np.bool8 = np.bool_  # type: ignore[attr-defined,unused-ignore]
 
 
 def _patch_base_model_module(module_name: str) -> str:
