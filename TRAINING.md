@@ -8,6 +8,7 @@ Launch:
 ```bash
 conda activate seismic_activity
 python train/fbp_train.py --fold A --model resnet34
+python train/fbp_train.py --config configs/train.yaml --fold A
 python train/fbp_train.py --fold A --patience 0          # train all --epochs
 python train/fbp_train.py --fold A --ckpt output/train_foldA_resnet34/best-epoch=013-step=015232.ckpt
 python train/fbp_train.py --fold A --ckpt-dir output/train_foldA_resnet34
@@ -17,8 +18,13 @@ python train/fbp_train.py --list-models
 ```
 
 Checkpointing and early stopping both watch **`valid/HitRate1px`**. Live notes go to
-`report/train_<label>_<model>_<YYYYMMDD_HHMMSS>/`. Weights and `model_config.yaml`
-go to `output/train_<label>_<model>/`.
+`report/train_<label>_<model>_<YYYYMMDD_HHMMSS>/`. Weights, `model_config.yaml`, and a
+copy of the recipe go to `output/train_<label>_<model>/`.
+
+Loop / split / loss / LR defaults live in [`configs/train.yaml`](configs/train.yaml)
+(`--config`). CLI flags override the recipe. `--fold`, `--sites`, paths, GPUs, and
+`--ckpt` stay on the command line. Precedence for `loss` / `lr` / `lr_step` /
+`encoder_weights`: recipe YAML → `--model-config` → CLI.
 
 After fit, score the best checkpoint with [`train/fbp_eval.py`](train/fbp_eval.py)
 (same `--fold` or `--sites`).
@@ -114,6 +120,7 @@ trace (`segm_first_break_prob_threshold=0`).
 
 | Knob | Default |
 | --- | --- |
+| Recipe file | [`configs/train.yaml`](configs/train.yaml) (`--config`) |
 | Optimizer | Adam, weight decay \(10^{-6}\) |
 | Learning rate | preset-specific (resnet18/34: `0.002136`); override with `--lr` |
 | Scheduler | `StepLR`, \(\gamma=0.1\), `--lr-step` **10** (choices 5 / 10 / 20). Step 20 with `--epochs 20` does not decay during the run. |
@@ -162,6 +169,7 @@ overlays. Use the same `--fold` as training.
 output/train_<sites-or-fold>_<model>/
   best-epoch=…-step=….ckpt
   model_config.yaml
+  train_recipe.yaml
   data_split.yaml
   tensorboard/  csv_logs/
   epoch_metrics.csv  train_valid_curves.png
