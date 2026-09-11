@@ -47,7 +47,10 @@ with `SEISMIC_BACKEND=hardpicks`.
 - `seismic_utils/hardpicks_bridge.py` — reuse hardpicks `ShotLineGatherDataset` when available
 - `seismic_utils/plotting.py` — gather plots + optional before/after/unlabeled overlay
 - `seismic_utils/predict.py` — load FBPUNet checkpoint + per-gather FB prediction
-- `models/` — local FBPUNet (cloned from hardpicks) used by `fbp_train.py`
+- `seismic_utils/fbp_eval_report.py` — validation report (scalars, Plotly HTML, gather PNGs)
+- `models/` — local FBPUNet (cloned from hardpicks) used by `train/fbp_train.py`
+- `train/fbp_train.py` — training CLI (folds, multi-GPU, living `report/` log)
+- `train/fbp_eval.py` — checkpoint validation / prediction report CLI
 - `seismic_utils/export_npz.py` — per line-gather NPZ export
 - `seismic_utils/npz_parser.py` — fast hardpicks-compatible dataset from NPZ
 - `viewer.py` — Gradio UI (reference / prediction / both pick display)
@@ -94,7 +97,7 @@ train_parser = create_npz_parser(
 )
 ```
 
-See `examples/local/fbp_train.py` or the notebook (`DATA_BACKEND = "npz"`).
+See `train/fbp_train.py` or the notebook (`DATA_BACKEND = "npz"`).
 
 ## Training
 
@@ -102,9 +105,9 @@ CLI script (recommended) — TensorBoard + CSV logs, step/epoch progress with lo
 
 ```bash
 conda activate seismic_activity   # or Lightning Studio kernel after setup_lightning.sh
-python examples/local/fbp_train.py --sites Brunswick,Halfmile --backend npz --epochs 5
-python examples/local/fbp_train.py --list-models
-python examples/local/fbp_train.py --sites Brunswick --model efficientnet-b0 --epochs 5
+python train/fbp_train.py --sites Brunswick,Halfmile --backend npz --epochs 5
+python train/fbp_train.py --list-models
+python train/fbp_train.py --sites Brunswick --model efficientnet-b0 --epochs 5
 
 # watch metrics
 tensorboard --logdir output/train_brunswick_halfmile_resnet18/tensorboard
@@ -128,4 +131,30 @@ jupyter notebook examples/local/fbp_train_with_api.ipynb
 ```
 
 Both write under `output/train_<sites>/`: best checkpoint (`valid/HitRate1px`),
-`epoch_metrics.csv`, and `train_valid_curves.png`.
+`epoch_metrics.csv`, and `train_valid_curves.png`. Live training notes go to
+`report/<run>_<YYYYMMDD_HHMMSS>/`.
+
+## Validation / prediction report
+
+After training, score a checkpoint on the fold (or site) validation split and write
+headline metrics, error histograms, offset slices, and worst/typical gather overlays:
+
+```bash
+python train/fbp_eval.py --ckpt-dir output/train_foldA_resnet34 --fold A --backend hdf5
+python train/fbp_eval.py --ckpt-dir /path/to/weights/baseline/foldA --fold A --backend hdf5 --data-dir /tmp/data/
+python train/fbp_eval.py --ckpt output/train_foldA_resnet34/best-epoch=013-step=015232.ckpt --fold A --backend npz
+```
+
+`--fold` uses the same whole-site holdout as training (fold A valid = Halfmile).
+`--sites` evaluates those sites; add `--eval-ratio 0.15` to reuse the intra-site
+holdout from `fbp_train.py`.
+
+Writes `report/eval_<label>_<encoder>_<YYYYMMDD_HHMMSS>/`:
+
+- `report.md` / `index.html` — headline HR@1–9, MAE, median/P90, RMSE, MBE (samples and ms)
+- `stats.html` — Plotly error histogram, CDF, HR/MAE vs offset
+- `worst.html` / `typical.html` — matplotlib gather overlays (PNG)
+- `traces.parquet` (or `traces.csv.gz`) — per-trace predictions and errors
+- `metrics.json`, `gathers.csv`, `offset_bins.csv`
+
+Open `index.html` in a browser. Plotly HTML loads Plotly from CDN.

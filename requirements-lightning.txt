@@ -18,6 +18,8 @@ numpy>=1.24
 matplotlib>=3.7
 pandas>=2.0
 pillow>=9.0
+plotly>=5.18
+pyarrow>=14.0
 gradio>=4.0
 tqdm>=4.66
 
