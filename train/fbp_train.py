@@ -18,6 +18,8 @@ Example::
     python train/fbp_train.py --sites Brunswick --model-config my_model.yaml
     python train/fbp_train.py --fold A --model resnet18
     python train/fbp_train.py --fold A --patience 0  # train all --epochs, no early stop
+    python train/fbp_train.py --config configs/train.yaml --fold A
+    python train/fbp_train.py --list-folds
     python train/fbp_train.py --fold A --ckpt output/train_foldA_resnet18/best-epoch=013-step=015232.ckpt
     python train/fbp_train.py --list-folds
     # live report: report/train_foldA_resnet18_YYYYMMDD_HHMMSS/report.md
@@ -69,6 +71,22 @@ logger = logging.getLogger("fbp_train")
 
 MONITOR_METRIC = "valid/HitRate1px"
 SEGMENTATION_CLASS_COUNT = 1
+DEFAULT_TRAIN_CONFIG = REPO_ROOT / "configs" / "train.yaml"
+
+# argparse dest names filled from configs/train.yaml (not model-config).
+_RECIPE_TRAINER_KEYS = (
+    "seed",
+    "backend",
+    "eval_ratio",
+    "epochs",
+    "batch_size",
+    "patience",
+    "precision",
+    "num_workers",
+    "log_every_n_steps",
+    "print_every_n_steps",
+    "model",
+)
 
 # Named architecture presets (all use local models.fbp.unet.FBPUNet). Decoder / LR
 # follow hardpicks fold configs where available. Keys are CLI --model names.
@@ -179,14 +197,75 @@ COMMON_SITE_PARAMS = {
 _MODEL_CONFIG_META_KEYS = frozenset({"lr", "model_name", "preset"})
 
 
+def _argv_list(argv: Optional[Sequence[str]]) -> List[str]:
+    if argv is None:
+        return sys.argv[1:]
+    return list(argv)
+
+
+def _config_flag_explicit(argv: Sequence[str]) -> bool:
+    return any(arg == "--config" or arg.startswith("--config=") for arg in argv)
+
+
+def resolve_train_config_path(path: Path) -> Path:
+    raw = Path(path).expanduser()
+    candidates: List[Path] = []
+    if raw.is_absolute():
+        candidates.append(raw)
+    else:
+        candidates.append((Path.cwd() / raw).resolve())
+        candidates.append((REPO_ROOT / raw).resolve())
+    seen = set()
+    uniq: List[Path] = []
+    for cand in candidates:
+        if cand in seen:
+            continue
+        seen.add(cand)
+        uniq.append(cand)
+        if cand.is_file():
+            return cand
+    return uniq[0] if uniq else raw.resolve()
+
+
+def load_train_recipe(path: Path, *, required: bool) -> tuple[Dict[str, Any], Path]:
+    resolved = resolve_train_config_path(path)
+    if not resolved.is_file():
+        if required:
+            raise SystemExit(f"train config not found: {path}")
+        logger.warning("train config not found (%s); using built-in argparse defaults", path)
+        return {}, resolved
+    data = yaml.safe_load(resolved.read_text()) or {}
+    if not isinstance(data, dict):
+        raise SystemExit(f"train config must be a mapping: {resolved}")
+    return data, resolved
+
+
+def _trainer_defaults_from_recipe(recipe: Dict[str, Any]) -> Dict[str, Any]:
+    return {key: recipe[key] for key in _RECIPE_TRAINER_KEYS if recipe.get(key) is not None}
+
+
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    argv_list = _argv_list(argv)
     preset_names = ", ".join(sorted(MODEL_PRESETS))
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument(
+        "--config",
+        type=Path,
+        default=DEFAULT_TRAIN_CONFIG,
+        help="Training recipe YAML (loop, split, model name, loss/LR). CLI flags override it.",
+    )
+    pre_args, _ = pre.parse_known_args(argv_list)
+    recipe, config_path = load_train_recipe(
+        pre_args.config, required=_config_flag_explicit(argv_list)
+    )
     p = argparse.ArgumentParser(
         description=(
             "Train FBPUNet first-break picker (NPZ or HDF5). "
-            "Use --sites for an intra-site split, or --fold A–K for hardpicks whole-site holdout."
+            "Use --sites for an intra-site split, or --fold A–K for hardpicks whole-site holdout. "
+            "Recipe defaults: configs/train.yaml (--config)."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        parents=[pre],
     )
     p.add_argument(
         "--sites",
@@ -377,7 +456,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="Skip re-validation with the best checkpoint after fit.",
     )
     p.add_argument("-v", "--verbose", action="store_true")
-    return p.parse_args(argv)
+    p.set_defaults(**_trainer_defaults_from_recipe(recipe))
+    args = p.parse_args(argv_list)
+    args.train_recipe = recipe
+    args.train_config_path = config_path
+    return args
 
 
 def resolve_model_name(name: str) -> str:
@@ -519,6 +602,7 @@ def build_model_config(
     encoder_weights: Optional[str] = None,
     loss_type: Optional[str] = None,
     lr_step: Optional[int] = None,
+    recipe: Optional[Dict[str, Any]] = None,
 ) -> tuple[Dict[str, Any], str]:
     """Build FBPUNet hyperparams from a preset and/or YAML/JSON override.
 
@@ -542,10 +626,20 @@ def build_model_config(
             model_label = str(enc)
 
     preset_lr = float(arch.pop("lr", 0.002136))
+    recipe = dict(recipe or {})
+    if recipe.get("lr") is not None:
+        preset_lr = float(recipe["lr"])
+    recipe_loss = recipe.get("loss")
+    recipe_lr_step = recipe.get("lr_step")
+    recipe_encoder = recipe.get("encoder_weights")
     file_lr = file_overrides.pop("lr", None)
     if isinstance(file_lr, dict):
         file_lr = None  # ignore accidental nested structures
     # optimizer_params.lr in the file still wins later via deep merge below.
+
+    recipe_encoder_w = None
+    if recipe_encoder not in (None, "", "none", "null"):
+        recipe_encoder_w = str(recipe_encoder)
 
     base = {
         "model_type": "FBPUNet",
@@ -555,13 +649,16 @@ def build_model_config(
         "use_dist_offsets": True,
         "use_first_break_prior": False,
         "coordconv": False,
-        "encoder_weights": None,
+        "encoder_weights": recipe_encoder_w,
         "optimizer_type": "Adam",
         "optimizer_params": {"lr": preset_lr, "weight_decay": 1e-6},
         "scheduler_type": "StepLR",
-        "scheduler_params": {"step_size": 10, "gamma": 0.1},
+        "scheduler_params": {
+            "step_size": int(recipe_lr_step) if recipe_lr_step is not None else 10,
+            "gamma": 0.1,
+        },
         "update_scheduler_at_epochs": True,
-        "loss_type": "crossentropy",
+        "loss_type": str(recipe_loss) if recipe_loss else "crossentropy",
         "loss_params": {},
         "use_full_metrics_during_training": False,
         "eval_type": "FBPEvaluator",
@@ -1070,6 +1167,7 @@ class TrainingReport:
                 f"**Devices:** {meta.get('num_devices', meta.get('devices', ''))}",
                 f"**Strategy:** {meta.get('strategy', '')}",
                 f"**Backend:** {meta.get('backend', '')}",
+                f"**Train config:** `{meta.get('train_config', '')}`",
                 f"**Experiment dir:** `{meta.get('output_dir', '')}`",
                 "",
                 "## Best checkpoint",
@@ -1552,6 +1650,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         encoder_weights=args.encoder_weights,
         loss_type=args.loss,
         lr_step=args.lr_step,
+        recipe=getattr(args, "train_recipe", None),
     )
     model_slug = "".join(c if c.isalnum() or c in "-_" else "-" for c in model_label.lower())
 
@@ -1596,6 +1695,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "devices": args.devices,
                 "strategy": args.strategy,
                 "precision": args.precision,
+                "train_config": str(getattr(args, "train_config_path", "")),
                 "run_stamp": run_stamp,
             },
         )
@@ -1622,12 +1722,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     if resume_ckpt is not None:
         print("Resume:", resume_ckpt)
+    print("Train config:", getattr(args, "train_config_path", DEFAULT_TRAIN_CONFIG))
     print("DATA_BACKEND:", args.backend, "| NPZ_ROOT:", npz_root)
 
     config_out = output_root / "model_config.yaml"
     with config_out.open("w") as f:
         yaml.safe_dump(model_config, f, sort_keys=False, default_flow_style=False)
     print("Wrote", config_out)
+
+    recipe_out = output_root / "train_recipe.yaml"
+    with recipe_out.open("w") as f:
+        yaml.safe_dump(
+            {
+                "source": str(getattr(args, "train_config_path", "")),
+                **dict(getattr(args, "train_recipe", None) or {}),
+            },
+            f,
+            sort_keys=False,
+            default_flow_style=False,
+        )
+    print("Wrote", recipe_out)
 
     split_out = output_root / "data_split.yaml"
     with split_out.open("w") as f:

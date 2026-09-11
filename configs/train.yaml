@@ -1,0 +1,27 @@
+# Default training *recipe* for train/fbp_train.py.
+# Loaded automatically. Override with --config PATH. CLI flags always win.
+#
+# Precedence for model knobs (loss, lr, lr_step, encoder_weights):
+#   this file → --model-config → CLI
+#
+# fold / sites / data-dir / devices / ckpt stay on the command line.
+
+seed: 0
+backend: npz                 # npz | hdf5
+eval_ratio: 0.15             # ignored when --fold is set
+
+# Lightning / loop
+epochs: 20
+batch_size: 16               # per GPU
+patience: 4                  # 0 = no early stop
+precision: "32"
+num_workers: 2
+log_every_n_steps: 10
+print_every_n_steps: 50
+
+# Model recipe
+model: resnet18
+encoder_weights: null        # e.g. imagenet
+loss: crossentropy           # crossentropy | dice
+lr: null                     # null = preset LR for --model
+lr_step: 10                  # StepLR step_size; 5 | 10 | 20
