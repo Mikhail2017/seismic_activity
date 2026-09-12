@@ -50,6 +50,9 @@ class BaseModel(pl.LightningModule):
             self.train_evaluator = eval_base.NoneEvaluator(hyper_params=None)
         self.update_scheduler_at_epochs = hyper_params["update_scheduler_at_epochs"]
         self.scheduler = None  # we'll manage the scheduler manually through this attribute...
+        self._pending_scheduler_state = None
+        self._loaded_training_checkpoint = False
+        self._scheduler_global_step = 0
         self.predict_eval_output_path = None  # will be set from outside if we want to dump results
         self.images_to_display = hyper_params.get("images_to_display", 0)
         self.data_ids_to_render_and_log = {}  # updated at 1st epoch start w/ random ids
@@ -149,8 +152,8 @@ class BaseModel(pl.LightningModule):
 
         # finally, report the average loss for the entire epoch (if not training)
         if prefix != "train" and losses is not None:
-            loss_array = [t.item() for t in losses]
-            results[f"{prefix}/loss"] = np.mean(loss_array)
+            from seismic_utils.validation import mean_epoch_loss
+            results[f"{prefix}/loss"] = mean_epoch_loss(losses)
 
         return results
 
@@ -161,11 +164,14 @@ class BaseModel(pl.LightningModule):
         evaluator: eval_base.EvaluatorBase,
     ):
         """Completes the epoch by asking the evaluator to summarize its results to log them."""
-        results = self._get_latest_metric_eval_results(
-            prefix=prefix,
-            losses=losses,
-            evaluator=evaluator,
-        )
+        distributed = torch.distributed.is_available() and torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1
+        if distributed and hasattr(evaluator, "metrics_metamap"):
+            from seismic_utils.validation import summarize_distributed_evaluator, mean_epoch_loss
+            results = summarize_distributed_evaluator(evaluator, prefix, self.device)
+            if prefix != "train" and losses is not None:
+                results[f"{prefix}/loss"] = mean_epoch_loss(losses, self.device, distributed=True)
+        else:
+            results = self._get_latest_metric_eval_results(prefix=prefix, losses=losses, evaluator=evaluator)
         # Here all the metrics are logged at the end of an epoch.
         # according to
         #   https://pytorch-lightning.readthedocs.io/en/stable/extensions/logging.html#logging-from-a-lightningmodule
@@ -190,6 +196,40 @@ class BaseModel(pl.LightningModule):
             assert isinstance(optimizer, torch.optim.Optimizer), \
                 "we currently only support one optimizer for the current impl; override this!"
             self.scheduler = self._create_scheduler(optimizer)
+            if self._pending_scheduler_state is not None:
+                # Construction can change optimizer LR (e.g. warmup schedules).
+                # The saved scheduler's LR is authoritative after restoration.
+                self.scheduler.load_state_dict(self._pending_scheduler_state)
+                for group, lr in zip(optimizer.param_groups, self.scheduler.get_last_lr()):
+                    group["lr"] = lr
+                self._pending_scheduler_state = None
+            elif self._loaded_training_checkpoint:
+                raise RuntimeError(
+                    "Checkpoint has no saved scheduler state; exact resume is unsafe. "
+                    "Use --init-ckpt for explicit weights-only initialization instead."
+                )
+            self._scheduler_global_step = self.global_step
+
+    def on_save_checkpoint(self, checkpoint):
+        """Persist the manually managed scheduler (not registered with Lightning)."""
+        if self.scheduler is not None:
+            checkpoint["seismic_scheduler_state"] = self.scheduler.state_dict()
+        checkpoint["seismic_validation_metrics"] = {
+            key: float(value) for key, value in self.trainer.callback_metrics.items()
+            if key.startswith("valid/")
+        }
+
+    def on_load_checkpoint(self, checkpoint):
+        self._pending_scheduler_state = checkpoint.get("seismic_scheduler_state")
+        self._loaded_training_checkpoint = bool(checkpoint.get("optimizer_states"))
+        self._checkpoint_validation_metrics = checkpoint.get("seismic_validation_metrics", {})
+
+    def on_train_batch_end(self, outputs, batch, batch_idx):
+        # Per-step schedules advance after optimizer updates, not before backward
+        # or on accumulation-only batches.
+        if not self.update_scheduler_at_epochs and self.global_step > self._scheduler_global_step:
+            self.scheduler.step()
+            self._scheduler_global_step = self.global_step
 
     def on_train_epoch_start(self):
         """Resets the evaluator state before the start of any new training epoch."""
@@ -224,8 +264,6 @@ class BaseModel(pl.LightningModule):
         self.log("train/learning_rate", self.scheduler.get_last_lr()[0])
         self.log("train/epoch", float(self.current_epoch))
         self._render_and_log_data_samples_from_ids(batch, batch_idx, preds, "train")
-        if not self.update_scheduler_at_epochs:
-            self.scheduler.step()  # this is useful for granular schedulers, e.g. cosine annealer
         # note: returning the predictions in this dict might blow up the memory for long epochs...
         return dict(loss=loss, metrics=metrics)  # loss is required in this dict!
 
@@ -249,11 +287,11 @@ class BaseModel(pl.LightningModule):
         preds, loss, metrics = self._generic_step(batch, batch_idx, self.valid_evaluator)
         self._render_and_log_data_samples_from_ids(batch, batch_idx, preds, "valid")
         # note: returning the predictions in this dict might blow up the memory for long epochs...
-        return dict(loss=loss, metrics=metrics)
+        return dict(loss=loss, metrics=metrics, loss_weight=self._last_eval_loss_weight)
 
     def validation_epoch_end(self, outputs: pl_types.EPOCH_OUTPUT):
         """Completes the epoch by asking the evaluator to summarize its results."""
-        losses = [d["loss"] if isinstance(d, dict) else d for d in outputs]
+        losses = [(d["loss"], d.get("loss_weight", 1.0)) if isinstance(d, dict) else d for d in outputs]
         self._generic_epoch_end(prefix="valid", losses=losses, evaluator=self.valid_evaluator)
 
     def on_test_epoch_start(self):
@@ -267,11 +305,11 @@ class BaseModel(pl.LightningModule):
         preds, loss, metrics = self._generic_step(batch, batch_idx, self.test_evaluator)
         self._render_and_log_data_samples_from_ids(batch, batch_idx, preds, "test")
         # note: returning the predictions in this dict might blow up the memory for long epochs...
-        return dict(loss=loss, metrics=metrics)
+        return dict(loss=loss, metrics=metrics, loss_weight=self._last_eval_loss_weight)
 
     def test_epoch_end(self, outputs: pl_types.EPOCH_OUTPUT):
         """Completes the epoch by asking the evaluator to summarize its results."""
-        losses = [d["loss"] if isinstance(d, dict) else d for d in outputs]
+        losses = [(d["loss"], d.get("loss_weight", 1.0)) if isinstance(d, dict) else d for d in outputs]
         self._generic_epoch_end(prefix="test", losses=losses, evaluator=self.test_evaluator)
 
     def on_predict_epoch_start(self):

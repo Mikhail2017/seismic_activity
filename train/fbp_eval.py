@@ -121,7 +121,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--backend", choices=("npz", "hdf5"), default="npz")
     p.add_argument("--data-dir", type=Path, default=Path(DEFAULT_DATA_DIR))
     p.add_argument("--npz-root", type=Path, default=None)
-    p.add_argument("--batch-size", type=int, default=4)
+    p.add_argument("--batch-size", type=int, default=None,
+                   help="Defaults to the saved training batch size (legacy checkpoints: 4).")
     p.add_argument("--num-workers", type=int, default=2)
     p.add_argument(
         "--eval-ratio",
@@ -304,9 +305,10 @@ def pred_ms_for_gather(item: Dict[str, Any], gdf: pd.DataFrame, dt_ms: float) ->
 
 
 def run_eval(model, loader, device: torch.device, evaluator) -> tuple[pd.DataFrame, Dict[str, float], float]:
+    from seismic_utils.validation import mean_epoch_loss
     model.eval()
     evaluator.reset()
-    losses: List[float] = []
+    losses = []
     try:
         from tqdm import tqdm
     except ImportError:
@@ -316,10 +318,10 @@ def run_eval(model, loader, device: torch.device, evaluator) -> tuple[pd.DataFra
         for batch_idx, batch in enumerate(tqdm(loader, desc="eval")):
             batch = batch_to_device(batch, device)
             _preds, loss, _metrics = model._generic_step(batch, batch_idx, evaluator)
-            losses.append(float(loss.detach().cpu()))
+            losses.append((float(loss.detach().cpu()), model._last_eval_loss_weight))
     evaluator.finalize()
     summary = evaluator.summarize()
-    mean_loss = float(np.mean(losses)) if losses else float("nan")
+    mean_loss = mean_epoch_loss(losses)
     return evaluator._dataframe.copy(), summary, mean_loss
 
 
@@ -421,6 +423,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     hp = dict(getattr(model, "hparams", {}) or {})
     if file_cfg:
         hp = {**file_cfg, **hp}
+    saved_batch_size = (hp.get("training_data") or {}).get("batch_size")
+    if args.batch_size is None:
+        args.batch_size = int(saved_batch_size or 4)
+    elif saved_batch_size and args.batch_size != int(saved_batch_size):
+        logger.warning("Batch size differs from training; batch-dependent padding can change predictions")
     hp["eval_metrics"] = merge_eval_metrics(hp.get("eval_metrics"))
     ckpt_picker = picker_from_hparams(hp)
     cli_picker = args.picker or ckpt_picker
