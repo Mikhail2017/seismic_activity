@@ -342,14 +342,30 @@ def resolve_linear_time_window(recipe: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+def _as_plain_dict(obj: Any) -> Optional[Dict[str, Any]]:
+    if obj is None:
+        return None
+    if isinstance(obj, dict):
+        return obj
+    if hasattr(obj, "items"):
+        try:
+            return dict(obj)
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
 def linear_time_window_from_hparams(hp: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """Return enabled window config from checkpoint / model hparams, else None."""
     if not hp:
         return None
-    td = hp.get("training_data") if isinstance(hp, dict) else None
-    site_params = (td or {}).get("site_params") if isinstance(td, dict) else None
-    raw = (site_params or {}).get("linear_time_window") if isinstance(site_params, dict) else None
-    if not isinstance(raw, dict):
+    root = _as_plain_dict(hp)
+    if root is None:
+        return None
+    td = _as_plain_dict(root.get("training_data"))
+    site_params = _as_plain_dict((td or {}).get("site_params"))
+    raw = (site_params or {}).get("linear_time_window")
+    if _as_plain_dict(raw) is None:
         return None
     cfg = resolve_linear_time_window({"linear_time_window": raw})
     return cfg if cfg.get("enabled") else None

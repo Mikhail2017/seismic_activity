@@ -17,6 +17,10 @@ Example::
         --fold A --backend npz
     python train/fbp_eval.py --picker before_after --ckpt-dir output/train_foldA_resnet34-before-after \\
         --fold A --backend hdf5 --rmse-above 7
+    # Match training backend + fold. linear_time_window is restored from the
+    # checkpoint (or sibling train_recipe.yaml); gallery plots use the windowed
+    # sample axis so reference and prediction share the same time origin.
+
 """
 
 from __future__ import annotations
@@ -27,6 +31,7 @@ import json
 import logging
 import sys
 from datetime import datetime
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -192,6 +197,77 @@ def find_model_config(ckpt: Path, ckpt_dir: Optional[Path], explicit: Optional[P
         if path.is_file():
             return path.resolve()
     return None
+
+
+def find_train_recipe(ckpt: Path, ckpt_dir: Optional[Path]) -> Optional[Path]:
+    candidates = []
+    if ckpt_dir is not None:
+        candidates.append(Path(ckpt_dir) / "train_recipe.yaml")
+    candidates.append(ckpt.parent / "train_recipe.yaml")
+    for path in candidates:
+        if path.is_file():
+            return path.resolve()
+    return None
+
+
+def resolve_eval_linear_time_window(
+    hp: Dict[str, Any],
+    *,
+    ckpt: Path,
+    ckpt_dir: Optional[Path],
+) -> Optional[Dict[str, Any]]:
+    cfg = train_cli.linear_time_window_from_hparams(hp)
+    if cfg:
+        return cfg
+    recipe_path = find_train_recipe(ckpt, ckpt_dir)
+    if recipe_path is not None:
+        loaded = yaml.safe_load(recipe_path.read_text()) or {}
+        if isinstance(loaded, dict):
+            cfg = train_cli.linear_time_window_from_hparams(
+                {
+                    "training_data": {
+                        "site_params": {"linear_time_window": loaded.get("linear_time_window")}
+                    }
+                }
+            )
+            if cfg:
+                logger.warning(
+                    "linear_time_window missing from checkpoint hparams; using %s",
+                    recipe_path,
+                )
+                return cfg
+    model_cfg_path = find_model_config(ckpt, ckpt_dir, explicit=None)
+    if model_cfg_path is None:
+        return None
+    loaded = yaml.safe_load(model_cfg_path.read_text()) or {}
+    if not isinstance(loaded, dict):
+        return None
+    cfg = train_cli.linear_time_window_from_hparams(loaded)
+    if cfg:
+        logger.warning(
+            "linear_time_window missing from checkpoint hparams; using %s",
+            model_cfg_path,
+        )
+    return cfg
+
+
+def shot_gather_for_eval_plot(item: Dict[str, Any]):
+    """Build a plot gather whose first breaks are on the same sample axis as ``samples``.
+
+    ``first_break_timestamps`` stay in original-record time after a linear time
+    window. Using them as the yellow reference against windowed predictions
+    looks like a systematic time-axis bias.
+    """
+    gather = hardpicks_item_to_shot_gather(item)
+    labels = np.asarray(item.get("first_break_labels"), dtype=np.float64).reshape(-1)
+    n = gather.n_traces
+    if labels.size < n:
+        return gather
+    dt = float(item.get("sample_rate_ms") or (gather.sample_rate_us / 1000.0))
+    fb = np.full(n, np.nan, dtype=np.float64)
+    keep = labels[:n] > 0
+    fb[keep] = labels[:n][keep] * dt
+    return replace(gather, first_breaks_ms=fb)
 
 
 def merge_eval_metrics(existing: Any) -> List[Dict[str, Any]]:
@@ -364,7 +440,7 @@ def plot_gallery(
             )
             continue
         item = parser[parser_idx]
-        gather = hardpicks_item_to_shot_gather(item)
+        gather = shot_gather_for_eval_plot(item)
         gdf = traces[
             (traces["OriginId"] == row.OriginId)
             & (traces["GatherId"] == row.GatherId)
@@ -464,6 +540,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     evaluator = make_eval_evaluator(hp, resolved_picker)
 
+    window_cfg = resolve_eval_linear_time_window(hp, ckpt=ckpt, ckpt_dir=args.ckpt_dir)
     parser = train_cli.build_split_parser(
         site_names,
         prefix="valid",
@@ -475,7 +552,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         use_eval_split=bool(eval_ratio),
         segm_class_count=int(hp["segm_class_count"]),
         first_break_prior=bool(getattr(model, "use_first_break_prior", False)),
-        linear_time_window=train_cli.linear_time_window_from_hparams(hp),
+        linear_time_window=window_cfg,
     )
     collate_fn = functools.partial(
         fbp_data_module.fbp_batch_collate,
@@ -494,11 +571,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         pin_memory=device.type == "cuda",
         **worker_kwargs,
     )
+    saved_backend = (hp.get("training_data") or {}).get("backend")
+    if saved_backend and str(saved_backend).strip().lower() != str(args.backend).strip().lower():
+        logger.warning(
+            "eval --backend %s differs from training backend %s; prefer matching it",
+            args.backend,
+            saved_backend,
+        )
     print(
         f"Picker: {resolved_picker}\n"
         f"Checkpoint: {ckpt}\n"
         f"Config: {config_path}\n"
         f"Eval sites: {site_names}  gathers={len(parser)}  batches={len(loader)}\n"
+        f"linear_time_window: {train_cli._fmt_linear_time_window(window_cfg)}\n"
         f"Device: {device}"
     )
 
