@@ -17,6 +17,8 @@ Example::
         --fold A --backend npz
     python train/fbp_eval.py --picker before_after --ckpt-dir output/train_foldA_resnet34-before-after \\
         --fold A --backend hdf5 --rmse-above 7
+    python train/fbp_eval.py --ckpt-dir output/train_foldA_resnet18-before-after-geomD_... \\
+        --fold A --backend hdf5   # GeoNorm stats restored from the checkpoint
 """
 
 from __future__ import annotations
@@ -191,6 +193,31 @@ def find_model_config(ckpt: Path, ckpt_dir: Optional[Path], explicit: Optional[P
     for path in candidates:
         if path.is_file():
             return path.resolve()
+    return None
+
+
+def resolve_eval_geom_stats(hp: Dict[str, Any], *, ckpt: Path, ckpt_dir: Optional[Path]):
+    from seismic_utils.geom import GeomStats
+
+    stats = GeomStats.from_mapping(hp.get("geom_stats"))
+    if stats is not None:
+        return stats
+    td = hp.get("training_data") if isinstance(hp.get("training_data"), dict) else None
+    if td:
+        stats = GeomStats.from_mapping(td.get("geom_stats"))
+        if stats is not None:
+            return stats
+    candidates = []
+    if ckpt_dir is not None:
+        candidates.append(Path(ckpt_dir) / "geom_stats.yaml")
+    candidates.append(ckpt.parent / "geom_stats.yaml")
+    for path in candidates:
+        if path.is_file():
+            loaded = yaml.safe_load(path.read_text()) or {}
+            stats = GeomStats.from_mapping(loaded)
+            if stats is not None:
+                logger.warning("geom_stats missing from checkpoint hparams; using %s", path)
+                return stats
     return None
 
 
@@ -476,6 +503,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         segm_class_count=int(hp["segm_class_count"]),
         first_break_prior=bool(getattr(model, "use_first_break_prior", False)),
     )
+    needs_geom = bool(
+        getattr(model, "use_geonorm", False) or getattr(model, "use_geom_input_channels", False)
+        or hp.get("use_geonorm") or hp.get("use_geom_input_channels")
+    )
+    if needs_geom:
+        from seismic_utils.geom import wrap_geom_features
+
+        stats = resolve_eval_geom_stats(hp, ckpt=ckpt, ckpt_dir=args.ckpt_dir)
+        if stats is None:
+            raise SystemExit(
+                "GeoNorm / geom input channels need train-only min-max stats; "
+                "missing geom_stats in the checkpoint and geom_stats.yaml next to it"
+            )
+        parser = wrap_geom_features(parser, stats)
     collate_fn = functools.partial(
         fbp_data_module.fbp_batch_collate,
         pad_to_nearest_pow2=True,
@@ -498,6 +539,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         f"Checkpoint: {ckpt}\n"
         f"Config: {config_path}\n"
         f"Eval sites: {site_names}  gathers={len(parser)}  batches={len(loader)}\n"
+        f"geonorm: {train_cli._fmt_geonorm({'ablation': hp.get('geonorm_ablation'), 'use_geonorm': getattr(model, 'use_geonorm', False), 'use_geom_input_channels': getattr(model, 'use_geom_input_channels', False), 'encoder_dim': getattr(model, 'geom_encoder_dim', 256)})}\n"
         f"Device: {device}"
     )
 

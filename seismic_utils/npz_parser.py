@@ -177,9 +177,18 @@ def npz_file_to_hardpicks_gather(
 
         rec_x = np.asarray(data["rec_x"], dtype=np.float64).reshape(-1) if "rec_x" in data.files else np.zeros(n_traces)
         rec_y = np.asarray(data["rec_y"], dtype=np.float64).reshape(-1) if "rec_y" in data.files else np.zeros(n_traces)
-        rec_coords = np.stack([rec_x, rec_y, np.zeros(n_traces, dtype=np.float64)], axis=1)
+        rec_z = np.asarray(data["rec_z"], dtype=np.float64).reshape(-1) if "rec_z" in data.files else np.zeros(n_traces)
+        rec_coords = np.stack([rec_x, rec_y, rec_z], axis=1)
 
         offset = np.asarray(data["offset"], dtype=np.float64).reshape(-1) if "offset" in data.files else None
+        if "shot_coords" in data.files:
+            shot_coords = np.asarray(data["shot_coords"], dtype=np.float64).reshape(-1)
+        else:
+            shot_xyz = []
+            for key in ("shot_x", "shot_y", "shot_z"):
+                if key in data.files:
+                    shot_xyz.append(float(np.asarray(data[key]).reshape(-1)[0]))
+            shot_coords = np.asarray(shot_xyz, dtype=np.float64) if len(shot_xyz) == 3 else np.zeros(3, dtype=np.float64)
         sample_rate_us = float(data["sample_rate_us"])
         asset = origin or (
             str(np.asarray(data["asset"])) if "asset" in data.files else path.parent.name
@@ -196,7 +205,7 @@ def npz_file_to_hardpicks_gather(
             "first_break_timestamps": fb_ts,
             "bad_first_breaks_mask": ~labeled,
             "rec_coords": rec_coords,
-            "shot_coords": np.zeros(3, dtype=np.float64),  # not stored in NPZ
+            "shot_coords": shot_coords,
             "trace_count": n_traces,
             "sample_count": n_samples,
             "sample_rate_ms": sample_rate_us / 1000.0,
@@ -258,12 +267,25 @@ def _meta_from_npz_file(
             if "rec_y" in data.files
             else np.zeros(n_traces)
         )
-        rec_coords = np.stack([rec_x, rec_y, np.zeros(n_traces, dtype=np.float64)], axis=1)
+        rec_z = (
+            np.asarray(data["rec_z"], dtype=np.float64).reshape(-1)
+            if "rec_z" in data.files
+            else np.zeros(n_traces)
+        )
+        rec_coords = np.stack([rec_x, rec_y, rec_z], axis=1)
         offset = (
             np.asarray(data["offset"], dtype=np.float64).reshape(-1)
             if "offset" in data.files
             else None
         )
+        if "shot_coords" in data.files:
+            shot_coords = np.asarray(data["shot_coords"], dtype=np.float64).reshape(-1)
+        else:
+            shot_xyz = []
+            for key in ("shot_x", "shot_y", "shot_z"):
+                if key in data.files:
+                    shot_xyz.append(float(np.asarray(data[key]).reshape(-1)[0]))
+            shot_coords = np.asarray(shot_xyz, dtype=np.float64) if len(shot_xyz) == 3 else np.zeros(3, dtype=np.float64)
 
         meta: dict[str, Any] = {
             "origin": origin,
@@ -276,7 +298,7 @@ def _meta_from_npz_file(
             "first_break_timestamps": fb_ts,
             "bad_first_breaks_mask": ~labeled,
             "rec_coords": rec_coords,
-            "shot_coords": np.zeros(3, dtype=np.float64),
+            "shot_coords": shot_coords,
             "trace_count": n_traces,
             "sample_count": n_samples,
             "sample_rate_ms": sample_rate_us / 1000.0,
@@ -309,6 +331,7 @@ class NpzShotLineGatherDataset(_TorchDataset):
         ("dead_rec_mask", True),
         ("rec_coords", 0),
         ("offset_distances", 0),
+        ("geom_features", 0),
         ("samples", 0),
     ]
 

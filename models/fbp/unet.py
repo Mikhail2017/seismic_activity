@@ -51,16 +51,24 @@ class FBPUNet(unet_base.UNet):
     ):
         """Validates+logs model hyperparameters and sets up the loss + metrics."""
         hyper_params = self._update_hyper_params_for_backward_compatibility(hyper_params)
+        hyper_params.setdefault("use_geonorm", False)
+        hyper_params.setdefault("use_geom_input_channels", False)
+        hyper_params.setdefault("geom_encoder_dim", 256)
+        hyper_params.setdefault("geom_norm_groups", 8)
         hp_utils.check_and_log_hp(
             names=[
                 "use_dist_offsets",
                 "use_first_break_prior",
                 "segm_first_break_prob_threshold",
+                "use_geonorm",
+                "use_geom_input_channels",
             ],
             hps=hyper_params,
         )
         self.use_dist_offsets = hyper_params["use_dist_offsets"]
         self.use_first_break_prior = hyper_params["use_first_break_prior"]
+        self.use_geonorm = bool(hyper_params.get("use_geonorm", False))
+        self.use_geom_input_channels = bool(hyper_params.get("use_geom_input_channels", False))
         self.segm_first_break_prob_threshold = hyper_params["segm_first_break_prob_threshold"]
         assert self.segm_first_break_prob_threshold >= 0.0
         super().__init__(hyper_params)
@@ -75,6 +83,7 @@ class FBPUNet(unet_base.UNet):
             batch,
             self.use_dist_offsets,
             self.use_first_break_prior,
+            use_geom_input_channels=self.use_geom_input_channels,
         )
         assert input_tensor.shape[1] == self.input_tensor_channels, "woopsie, messed up feature prep?"
         return input_tensor
@@ -86,6 +95,8 @@ class FBPUNet(unet_base.UNet):
             input_ch_count += 3
         if self.use_first_break_prior:
             input_ch_count += 1
+        if self.use_geom_input_channels:
+            input_ch_count += 2
         return input_ch_count
 
     def _get_persistent_data_id(

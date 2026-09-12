@@ -170,11 +170,18 @@ def predict_first_breaks_ms(
     """
     import torch
     import hardpicks.data.fbp.data_module as fbp_data_module
-    import hardpicks.models.fbp.utils as model_utils
+    import models.fbp.utils as model_utils
 
+    from .geom import GeomStats, attach_geom_features, model_needs_geom
     from .pickers import picker_from_model
 
     prepared = _prepare_gather_for_inference(hardpicks_gather)
+    if model_needs_geom(model):
+        hp = dict(getattr(model, "hparams", {}) or {})
+        stats = GeomStats.from_mapping(hp.get("geom_stats"))
+        if stats is None:
+            raise ValueError("GeoNorm checkpoint is missing geom_stats in hparams")
+        attach_geom_features(prepared, stats)
     n_traces = int(prepared["trace_count"])
     dt_ms = float(prepared["sample_rate_ms"])
     resolved_picker = picker or picker_from_model(model)
@@ -185,8 +192,12 @@ def predict_first_breaks_ms(
             batch,
             use_dist_offsets=model.use_dist_offsets,
             use_first_break_prior=model.use_first_break_prior,
+            use_geom_input_channels=bool(getattr(model, "use_geom_input_channels", False)),
         ).to(model.device).float()
-        logits = model(input_tensor)
+        geom = batch.get("geom_features")
+        if geom is not None:
+            geom = geom.to(model.device).float()
+        logits = model(input_tensor, geom=geom if getattr(model, "use_geonorm", False) else None)
         pred_idx, _ = decode_fb_picks(
             logits, model, picker=resolved_picker, smooth_threshold=smooth_threshold
         )

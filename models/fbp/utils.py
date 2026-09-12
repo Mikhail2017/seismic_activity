@@ -17,6 +17,7 @@ def prepare_input_features(
     use_dist_offsets: bool = False,
     use_first_break_prior: bool = False,
     augmentations: typing.Optional[typing.Iterable[typing.Callable]] = None,
+    use_geom_input_channels: bool = False,
 ) -> torch.Tensor:
     """Returns the 'input feature tensor' to forward through the model for FBP tasks."""
     assert "samples" in batch, "missing the batched 2D arrays that contain sampled amplitudes?"
@@ -48,7 +49,18 @@ def prepare_input_features(
             input_tensor,
             first_break_prior.unsqueeze(1),
         ], dim=1).type(input_tensor.dtype)
-    # TODO: if we want to concatenate more features into the input tensor, we'd do it here
+    if use_geom_input_channels:
+        assert "geom_features" in batch, \
+            "missing 'geom_features' (train/eval must wrap the parser with geometry stats)"
+        geom = batch["geom_features"]
+        assert geom.ndim == 3 and geom.shape[-1] == 2, f"geom_features shape {tuple(geom.shape)}"
+        assert geom.shape[0] == input_tensor.shape[0]
+        assert geom.shape[1] == input_tensor.shape[2]
+        geom_maps = geom.transpose(1, 2).unsqueeze(-1)
+        input_tensor = torch.cat([
+            input_tensor,
+            geom_maps.repeat(1, 1, 1, input_tensor.shape[-1]),
+        ], dim=1).type(input_tensor.dtype)
     if augmentations:
         for augop in augmentations:
             input_tensor = augop(input_tensor)

@@ -29,6 +29,7 @@ def validate_resume_checkpoint(checkpoint, config):
         "segm_class_count", "unet_encoder_type", "unet_decoder_type", "encoder_block_count",
         "encoder_block_channels", "decoder_block_channels", "mid_block_channels",
         "decoder_attention_type", "use_dist_offsets", "use_first_break_prior", "coordconv",
+        "use_geonorm", "use_geom_input_channels", "geom_encoder_dim", "geom_norm_groups",
         "loss_type", "loss_params", "optimizer_type", "optimizer_params", "scheduler_type",
         "scheduler_params", "update_scheduler_at_epochs", "segm_first_break_prob_threshold",
         "segm_first_break_smooth_threshold", "training_data",

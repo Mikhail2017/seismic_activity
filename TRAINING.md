@@ -124,6 +124,30 @@ The recipe on the training machine matters: `--picker before_after --fold A`
 alone does not select ResNet34, HDF5, four epochs, or batch size 32. Specify those
 flags or preserve the resolved recipe/model config when reproducing a run.
 
+## Geometry-conditioned U-Net (GeoNorm)
+
+`geonorm.md` maps per-trace offset/elevation into the existing FBPUNet. Opt-in
+via recipe `geonorm:` or `--geonorm A|B|C|D` (default **A**, unchanged baseline).
+
+| Ablation | Offset/elev input channels | GeoNorm |
+| --- | --- | --- |
+| A | no | no |
+| B | yes | no |
+| C | no | yes (every 2D norm → GroupNorm + per-trace scale/shift) |
+| D | yes | yes |
+
+`δx`/`δz` are min-max normalized on **training gathers only** and written next
+to the checkpoint (`geom_stats.yaml`). Flip/drop/pad keep `geom_features`
+aligned with traces. Eval restores the same stats:
+
+```bash
+python train/fbp_train.py --fold A --picker before_after --geonorm D
+python train/fbp_eval.py --ckpt-dir output/train_foldA_resnet18-before-after-geomD_... --fold A
+```
+
+GeoNorm modulates the **trace** axis of `(B, C, traces, time)` — not time.
+Existing `use_dist_offsets` channels stay independent of ablation B's two maps.
+
 ## Regression validation
 
 Run from the repository root in the `seismic_activity` environment:

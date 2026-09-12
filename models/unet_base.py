@@ -18,6 +18,7 @@ except ImportError:
 
 import hardpicks.metrics.base as metrics_base
 import models.coordconv as coordconv_utils
+import models.geonorm as geonorm_utils
 import models.resnet as custom_resnet
 import models.segm_base as model_base
 import hardpicks.utils.hp_utils as hp_utils
@@ -360,6 +361,21 @@ class UNet(model_base.BaseSegmModel):
             decoder_output_channels=self.head_class_count,
         )
         self.warned_bad_input_size_power2 = False
+        self.use_geonorm = bool(hyper_params.get("use_geonorm", False))
+        self.geom_encoder_dim = int(hyper_params.get("geom_encoder_dim", 256))
+        self.geom_norm_groups = int(hyper_params.get("geom_norm_groups", 8))
+        self.geom_encoder = None
+        if self.use_geonorm:
+            if self.geom_encoder_dim <= 0:
+                raise ValueError("geom_encoder_dim must be > 0")
+            self.geom_encoder = geonorm_utils.GeomEncoder(in_dim=2, hidden=self.geom_encoder_dim)
+            n_enc = geonorm_utils.replace_norms_with_geonorm(
+                self.encoder, self.geom_encoder_dim, groups=self.geom_norm_groups
+            )
+            n_dec = geonorm_utils.replace_norms_with_geonorm(
+                self.decoder, self.geom_encoder_dim, groups=self.geom_norm_groups
+            )
+            logger.info("Replaced %d encoder + %d decoder norms with GeoNorm", n_enc, n_dec)
 
     @staticmethod
     def _get_model_block_types(
@@ -587,13 +603,32 @@ class UNet(model_base.BaseSegmModel):
         return encoder, decoder
 
     @profile
-    def forward(self, x):
+    def forward(self, x, geom=None):
         """Forwards the provided tensor through the encoder/mid_block/decoder modules."""
         if torch.is_grad_enabled() and self.use_checkpointing:
             # Only set grad equals true on input if we are in a training phase.
             # this is required by fairscale's checkpointing method.
             x.requires_grad_(True)
         self._check_input_tensor_pow2_size(x)
+        if self.use_geonorm:
+            if geom is None:
+                raise ValueError("GeoNorm models require a geom tensor of shape (B, traces, 2)")
+            if self.geom_encoder is None:
+                raise RuntimeError("use_geonorm is set but geom_encoder was not built")
+            geom = geom.to(device=x.device, dtype=x.dtype)
+            if geom.dim() != 3 or geom.shape[0] != x.shape[0] or geom.shape[-1] != 2:
+                raise ValueError(
+                    f"geom tensor shape {tuple(geom.shape)} expected (B, traces, 2) "
+                    f"with B={x.shape[0]}"
+                )
+            if geom.shape[1] != x.shape[2]:
+                raise ValueError(
+                    f"geom traces {geom.shape[1]} != feature traces {x.shape[2]}"
+                )
+            emb = self.geom_encoder(geom)
+            with geonorm_utils.geom_embedding_context(emb):
+                feat_maps = self.encoder(x)
+                return self.decoder(feat_maps)
         feat_maps = self.encoder(x)
         out = self.decoder(feat_maps)
         return out
@@ -607,7 +642,8 @@ class UNet(model_base.BaseSegmModel):
     ) -> typing.Tuple[typing.Any, torch.Tensor, typing.Dict[typing.AnyStr, float]]:
         """Runs the prediction + evaluation step for training/validation/testing."""
         input_tensor = self._prepare_input_features(batch)
-        preds = self(input_tensor)  # calls the forward pass of the model
+        geom = batch.get("geom_features") if getattr(self, "use_geonorm", False) else None
+        preds = self(input_tensor, geom=geom)
         assert self.segm_mask_field_name in batch, "forgot to generate the segmentation masks in preproc?"
         targets = batch[self.segm_mask_field_name].long()
         from seismic_utils.validation import unique_validation_batch, loss_weight

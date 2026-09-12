@@ -143,8 +143,10 @@ def offset_bin_table(df: pd.DataFrame, n_bins: int = 12) -> pd.DataFrame:
                 "offset_mid": 0.5 * (left + right),
                 "n": int(len(g)),
                 "HitRate1px": float((abs_err < 1).mean()),
+                "HitRate3px": float((abs_err < 3).mean()),
                 "HitRate5px": float((abs_err < 5).mean()),
                 "MAE": float(abs_err.mean()),
+                "RMSE": float(np.sqrt((abs_err ** 2).mean())),
                 "MBE": float(g["Errors"].mean()),
             }
         )

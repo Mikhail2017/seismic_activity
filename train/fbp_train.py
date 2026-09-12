@@ -301,6 +301,92 @@ def _aug_type_names(augmentations: Sequence[Dict[str, Any]]) -> List[str]:
     return [str(op.get("type", "?")) for op in augmentations]
 
 
+GEONORM_ABLATIONS: Dict[str, tuple] = {
+    # (use_geom_input_channels, use_geonorm)
+    "A": (False, False),
+    "B": (True, False),
+    "C": (False, True),
+    "D": (True, True),
+}
+
+
+def _geonorm_letter(input_channels: bool, geonorm: bool) -> str:
+    for letter, flags in GEONORM_ABLATIONS.items():
+        if flags == (input_channels, geonorm):
+            return letter
+    return "custom"
+
+
+def resolve_geonorm_config(
+    recipe: Dict[str, Any],
+    cli: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Ablation A–D from recipe ``geonorm:`` or ``--geonorm``. Default is A (off)."""
+    raw: Any = cli if cli not in (None, "") else recipe.get("geonorm")
+    out: Dict[str, Any] = {
+        "ablation": "A",
+        "use_geom_input_channels": False,
+        "use_geonorm": False,
+        "encoder_dim": 256,
+        "groups": 8,
+    }
+    if raw is None or raw is False:
+        return out
+    if isinstance(raw, str) and raw.strip().lower() in {"", "a", "off", "none", "null", "false", "0"}:
+        return out
+    if raw is True:
+        raw = "D"
+
+    extra: Dict[str, Any] = {}
+    letter = "A"
+    if isinstance(raw, str):
+        letter = raw.strip().upper()
+    elif isinstance(raw, dict):
+        extra = raw
+        letter = str(raw.get("ablation") or "A").strip().upper()
+    else:
+        raise SystemExit("train config 'geonorm' must be A/B/C/D, a mapping, true/false, or null")
+    if letter not in GEONORM_ABLATIONS:
+        raise SystemExit(f"geonorm ablation must be A/B/C/D, got {letter!r}")
+    inp, gn = GEONORM_ABLATIONS[letter]
+    if "input_channels" in extra:
+        inp = bool(extra["input_channels"])
+    if "use_geom_input_channels" in extra:
+        inp = bool(extra["use_geom_input_channels"])
+    if "enabled" in extra:
+        gn = bool(extra["enabled"])
+    if "use_geonorm" in extra:
+        gn = bool(extra["use_geonorm"])
+    dim = extra.get("encoder_dim", extra.get("geom_encoder_dim", 256))
+    groups = extra.get("groups", extra.get("geom_norm_groups", 8))
+    out["use_geom_input_channels"] = bool(inp)
+    out["use_geonorm"] = bool(gn)
+    out["ablation"] = _geonorm_letter(bool(inp), bool(gn))
+    out["encoder_dim"] = int(dim)
+    out["groups"] = int(groups)
+    if out["encoder_dim"] <= 0:
+        raise SystemExit("geonorm.encoder_dim must be > 0")
+    if out["groups"] <= 0:
+        raise SystemExit("geonorm.groups must be > 0")
+    return out
+
+
+def _fmt_geonorm(cfg: Any) -> str:
+    if not isinstance(cfg, dict):
+        return "A (off)"
+    letter = cfg.get("ablation") or _geonorm_letter(
+        bool(cfg.get("use_geom_input_channels")), bool(cfg.get("use_geonorm"))
+    )
+    if letter == "A" and not cfg.get("use_geonorm") and not cfg.get("use_geom_input_channels"):
+        return "A (off)"
+    bits = []
+    if cfg.get("use_geom_input_channels"):
+        bits.append("input-channels")
+    if cfg.get("use_geonorm"):
+        bits.append(f"GeoNorm h={cfg.get('encoder_dim', 256)}")
+    return f"{letter} ({', '.join(bits) or 'off'})"
+
+
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     argv_list = _argv_list(argv)
     preset_names = ", ".join(sorted(MODEL_PRESETS))
@@ -526,6 +612,15 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="Segmentation loss (default: crossentropy, or --model-config).",
     )
     p.add_argument(
+        "--geonorm",
+        default=None,
+        metavar="ABCD",
+        help=(
+            "Geometry-conditioned U-Net ablation A/B/C/D (geonorm.md). "
+            "Default: recipe geonorm: or A (off). CLI wins over YAML."
+        ),
+    )
+    p.add_argument(
         "--ckpt",
         type=Path,
         default=None,
@@ -551,6 +646,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     args.train_recipe = recipe
     args.train_config_path = config_path
     args.train_augmentations = resolve_train_augmentations(recipe)
+    args.geonorm_config = resolve_geonorm_config(recipe, args.geonorm)
     if int(args.save_top_k) < -1:
         p.error("--save-top-k must be -1 (every epoch) or >= 0")
     args.save_top_k = int(args.save_top_k)
@@ -711,6 +807,7 @@ def build_model_config(
     recipe: Optional[Dict[str, Any]] = None,
     picker: Optional[str] = None,
     smooth_threshold: Optional[int] = None,
+    geonorm: Optional[Dict[str, Any]] = None,
 ) -> tuple[Dict[str, Any], str]:
     """Build FBPUNet hyperparams from a preset and/or YAML/JSON override.
 
@@ -775,6 +872,11 @@ def build_model_config(
         "segm_class_count": SEGMENTATION_CLASS_COUNT,
         "use_dist_offsets": True,
         "use_first_break_prior": False,
+        "use_geonorm": False,
+        "use_geom_input_channels": False,
+        "geom_encoder_dim": 256,
+        "geom_norm_groups": 8,
+        "geonorm_ablation": "A",
         "coordconv": False,
         "encoder_weights": recipe_encoder_w,
         "optimizer_type": "Adam",
@@ -842,6 +944,18 @@ def build_model_config(
         sched["step_size"] = int(lr_step)
         base["scheduler_params"] = sched
 
+    if recipe.get("use_dist_offsets") is not None:
+        base["use_dist_offsets"] = bool(recipe["use_dist_offsets"])
+
+    geonorm_cfg = geonorm if geonorm is not None else resolve_geonorm_config(recipe)
+    base["use_geonorm"] = bool(geonorm_cfg.get("use_geonorm"))
+    base["use_geom_input_channels"] = bool(geonorm_cfg.get("use_geom_input_channels"))
+    base["geom_encoder_dim"] = int(geonorm_cfg.get("encoder_dim", 256))
+    base["geom_norm_groups"] = int(geonorm_cfg.get("groups", 8))
+    base["geonorm_ablation"] = str(geonorm_cfg.get("ablation") or "A")
+    if base["geonorm_ablation"] not in {"A", ""} and "geom" not in model_label.lower():
+        model_label = f"{model_label}-geom{base['geonorm_ablation']}"
+
     picker_spec = spec_for(resolved_picker)
     base["picker"] = picker_spec.name
     base["segm_class_count"] = int(picker_spec.segm_class_count or 1)
@@ -879,6 +993,7 @@ def list_models() -> None:
     print("Pretrained backbones: --encoder-weights imagenet  (or ssl/swsl/… per encoder)")
     print("Before/after head: --picker before_after or append -before-after (e.g. resnet34-before-after).")
     print("*-horizon is the linear-moveout prior channel, not the before/after head.")
+    print("Geometry-conditioned U-Net: --geonorm A|B|C|D or recipe geonorm: (see geonorm.md).")
     print("Override anything with --model-config path/to.yaml")
 
 
@@ -1935,6 +2050,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         recipe=getattr(args, "train_recipe", None),
         picker=args.picker,
         smooth_threshold=args.smooth_threshold,
+        geonorm=getattr(args, "geonorm_config", None),
     )
     model_config["training_data"] = {
         "preprocessing_version": PREPROCESSING_VERSION,
@@ -1992,6 +2108,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "augmentations": _aug_type_names(
                     getattr(args, "train_augmentations", None) or []
                 ),
+                "geonorm": _fmt_geonorm(getattr(args, "geonorm_config", None)),
                 "resume_ckpt": str(resume_ckpt) if resume_ckpt else None,
                 "init_ckpt": str(args.init_ckpt) if args.init_ckpt else None,
                 "preprocessing_version": PREPROCESSING_VERSION,
@@ -2025,6 +2142,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     print("encoder_weights:", model_config.get("encoder_weights"))
     print("first_break_prior:", bool(model_config.get("use_first_break_prior")))
+    print("geonorm:", _fmt_geonorm(getattr(args, "geonorm_config", None)))
+    print("use_dist_offsets:", bool(model_config.get("use_dist_offsets")))
     print(
         "loss:",
         model_config.get("loss_type"),
@@ -2104,6 +2223,37 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         augmentations=getattr(args, "train_augmentations", None),
         first_break_prior=bool(model_config.get("use_first_break_prior")),
     )
+    needs_geom = bool(
+        model_config.get("use_geonorm") or model_config.get("use_geom_input_channels")
+    )
+    if needs_geom:
+        from seismic_utils.geom import GeomStats, accumulate_geom_stats, wrap_geom_features
+
+        stats = None
+        if resume_ckpt is not None:
+            saved_hp = load_checkpoint(resume_ckpt).get("hyper_parameters") or {}
+            stats = GeomStats.from_mapping(saved_hp.get("geom_stats"))
+        if stats is None:
+            print("Fitting geometry min-max stats on training gathers...")
+            stats = accumulate_geom_stats(train_parser)
+        model_config["geom_stats"] = stats.to_dict()
+        train_parser = wrap_geom_features(train_parser, stats)
+        valid_parser = wrap_geom_features(valid_parser, stats)
+        print(
+            "geom_stats:",
+            f"dx=[{stats.dx_min:.4g}, {stats.dx_max:.4g}]",
+            f"dz=[{stats.dz_min:.4g}, {stats.dz_max:.4g}]",
+            f"n={stats.n_traces}",
+        )
+        if rank_zero:
+            _atomic_write_text(
+                output_root / "model_config.yaml",
+                yaml.safe_dump(model_config, sort_keys=False),
+            )
+            _atomic_write_text(
+                output_root / "geom_stats.yaml",
+                yaml.safe_dump(stats.to_dict(), sort_keys=False),
+            )
     train_loader, valid_loader = build_loaders(
         train_parser,
         valid_parser,
