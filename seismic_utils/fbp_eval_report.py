@@ -161,6 +161,10 @@ def gather_summary(df: pd.DataFrame) -> pd.DataFrame:
         "n_traces": ("Errors", "size"),
         "n_labeled": ("Errors", "count"),
         "MAE": ("AbsError", "mean"),
+        "RMSE": (
+            "AbsError",
+            lambda s: float(np.sqrt((s.dropna() ** 2).mean())) if s.notna().any() else np.nan,
+        ),
         "P90AbsError": (
             "AbsError",
             lambda s: float(s.quantile(0.90)) if s.notna().any() else np.nan,
@@ -198,6 +202,16 @@ def pick_gallery_gathers(
     if typical.empty:
         typical = remaining.head(int(n_typical))
     return worst, typical
+
+
+def pick_high_rmse_gathers(gather_df: pd.DataFrame, rmse_above: float) -> pd.DataFrame:
+    """Every labeled gather whose RMSE (samples) is strictly greater than *rmse_above*."""
+    if gather_df.empty or "RMSE" not in gather_df.columns:
+        return gather_df.iloc[0:0].copy()
+    ranked = gather_df.dropna(subset=["RMSE"]).copy()
+    selected = ranked.loc[ranked["RMSE"] > float(rmse_above)]
+    cols = [c for c in ("RMSE", "MAE") if c in selected.columns]
+    return selected.sort_values(cols, ascending=False)
 
 
 def write_trace_table(df: pd.DataFrame, path: Path) -> Path:
@@ -464,6 +478,7 @@ def write_report_md(
     offset_df: pd.DataFrame,
     worst_names: Iterable[str],
     typical_names: Iterable[str],
+    high_rmse_names: Iterable[str] = (),
 ) -> Path:
     lines = [
         f"# FBP validation — {meta.get('run_name', '')}",
@@ -519,18 +534,34 @@ def write_report_md(
     lines.extend(["", "## Typical gathers", ""])
     for name in typical_names:
         lines.append(f"- `{name}`")
-    lines.extend(
-        [
-            "",
-            "## Files",
-            "",
-            "- [index.html](index.html)",
-            "- [stats.html](stats.html) (Plotly)",
-            "- [worst.html](worst.html)",
-            "- [typical.html](typical.html)",
-            "",
-        ]
-    )
+    high_rmse_names = list(high_rmse_names)
+    if meta.get("rmse_above") is not None or high_rmse_names:
+        thresh = meta.get("rmse_above")
+        lines.extend(
+            [
+                "",
+                f"## High-RMSE gathers (RMSE > {thresh} samples)",
+                "",
+            ]
+        )
+        if high_rmse_names:
+            for name in high_rmse_names:
+                lines.append(f"- `{name}`")
+        else:
+            lines.append("_None._")
+    file_lines = [
+        "",
+        "## Files",
+        "",
+        "- [index.html](index.html)",
+        "- [stats.html](stats.html) (Plotly)",
+        "- [worst.html](worst.html)",
+        "- [typical.html](typical.html)",
+    ]
+    if high_rmse_names or meta.get("rmse_above") is not None:
+        file_lines.append("- [high_rmse.html](high_rmse.html)")
+    file_lines.append("")
+    lines.extend(file_lines)
     path = Path(path)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return path
