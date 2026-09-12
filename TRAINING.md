@@ -7,6 +7,62 @@ or `model: resnet34-before-after` (combinable with `-horizon`).
 `--encoder-weights imagenet` (etc.) initializes the backbone; default is
 train from scratch. `--model-config path.yaml` merges on top of the preset.
 
+## Site folds
+
+`--fold` is a **whole-site holdout**: every gather from a listed train site
+goes to training, and every gather from the valid site goes to validation.
+There is **no** intra-site `--eval-ratio` split when `--fold` is set.
+`--fold` and `--sites` are mutually exclusive.
+
+Sites in this repo: **Brunswick**, **Halfmile**, **Lalor**, **Sudbury**.
+Hardpicks also defines Kevitsa/Matagami; those files are not here, so fold
+**E** cannot run.
+
+```bash
+python train/fbp_train.py --fold A
+python train/fbp_train.py --list-folds
+```
+
+Accepts `A`, `foldA`, `fold_a`. Use the same `--fold` with `train/fbp_eval.py`
+so the validation site matches training.
+
+### Leave-one-site-out (3 train / 1 valid)
+
+A–D rotate the four local sites. Fold A matches hardpicks `foldA.yaml`
+exactly; B–D are the same rotation with Kevitsa/Matagami dropped.
+
+| Fold | Train | Valid |
+| --- | --- | --- |
+| A | Lalor, Brunswick, Sudbury | Halfmile |
+| B | Lalor, Brunswick, Halfmile | Sudbury |
+| C | Halfmile, Lalor, Sudbury | Brunswick |
+| D | Sudbury, Halfmile, Brunswick | Lalor |
+| E | — | unavailable (needs Matagami/Kevitsa) |
+
+### Hardpicks YAMLs that already omit Kevitsa (2 train / 1 valid)
+
+F–K copy the hardpicks fold YAMLs that never included Kevitsa.
+
+| Fold | Train | Valid |
+| --- | --- | --- |
+| F | Halfmile, Brunswick | Sudbury |
+| G | Brunswick, Sudbury | Halfmile |
+| H | Halfmile, Lalor | Brunswick |
+| I | Sudbury, Halfmile | Lalor |
+| J | Lalor, Brunswick | Sudbury |
+| K | Brunswick, Sudbury | Halfmile |
+
+G and K are the same split; both letters exist because hardpicks ships both
+YAMLs.
+
+### `--sites` (no named fold)
+
+If you pass `--sites Brunswick,Halfmile` instead of `--fold`, those sites are
+used for **both** train and valid, and `eval_ratio` (default `0.15` from the
+recipe YAML) holds out a random subset of shots/lines inside the sites.
+
+Defined in `SITE_FOLDS` / `UNAVAILABLE_FOLDS` in `train/fbp_train.py`.
+
 ## Validation and checkpoint consistency
 
 HDF5 training/evaluation uses the tracked local `OwnedMetadataGatherDataset`.
