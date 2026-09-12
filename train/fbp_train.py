@@ -26,7 +26,7 @@ Example::
     # live report: report/train_foldA_resnet18_YYYYMMDD_HHMMSS/report.md
 
     # multi-GPU (batch size is per GPU). Prefer torchrun for DDP:
-    torchrun --nproc_per_node=4 train/fbp_train.py --fold A --devices 4
+    torchrun --standalone --nproc_per_node=4 train/fbp_train.py --fold A --devices 4
     python train/fbp_train.py --fold A --devices 2 --strategy ddp_spawn
     python train/fbp_train.py --fold A --devices 0,1 --strategy dp
 
@@ -41,6 +41,7 @@ import csv
 import functools
 import json
 import logging
+import math
 import os
 import shutil
 import sys
@@ -76,6 +77,11 @@ from seismic_utils.pickers import (
     split_before_after_model,
 )
 from seismic_utils.predict import resolve_checkpoint
+from seismic_utils.training_state import (
+    PREPROCESSING_VERSION, load_checkpoint, validate_resume_checkpoint,
+    reserve_run_directory, run_token, wait_for_run_directory,
+)
+from seismic_utils.validation import IndexedValidationDataset
 
 logger = logging.getLogger("fbp_train")
 
@@ -432,7 +438,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--output-dir",
         type=Path,
         default=None,
-        help="Experiment directory (default: output/train_<sites-or-fold>_<model>).",
+        help="Empty experiment directory (default: output/train_<sites-or-fold>_<model>_<run-id>).",
     )
     p.add_argument(
         "--report-dir",
@@ -529,8 +535,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--ckpt-dir",
         type=Path,
         default=None,
-        help="Directory of best*.ckpt; resumes from the newest (used if --ckpt is omitted).",
+        help="Directory with best_checkpoint.json or a single best*.ckpt (used if --ckpt is omitted).",
     )
+    p.add_argument("--init-ckpt", type=Path, default=None,
+                   help="Initialize weights only; start a new optimizer/scheduler (not an exact resume).")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument(
         "--no-final-validate",
@@ -546,6 +554,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     if int(args.save_top_k) < -1:
         p.error("--save-top-k must be -1 (every epoch) or >= 0")
     args.save_top_k = int(args.save_top_k)
+    if args.init_ckpt and (args.ckpt or args.ckpt_dir):
+        p.error("--init-ckpt cannot be combined with --ckpt/--ckpt-dir")
     return args
 
 
@@ -836,8 +846,12 @@ def build_model_config(
     base["picker"] = picker_spec.name
     base["segm_class_count"] = int(picker_spec.segm_class_count or 1)
     base["segm_first_break_smooth_threshold"] = int(
-        smooth_threshold if smooth_threshold is not None else DEFAULT_SMOOTH_THRESHOLD
+        smooth_threshold if smooth_threshold is not None else base.get(
+            "segm_first_break_smooth_threshold", recipe.get("smooth_threshold", DEFAULT_SMOOTH_THRESHOLD)
+        )
     )
+    if base["segm_first_break_smooth_threshold"] < 1:
+        raise ValueError("smooth_threshold must be positive")
 
     base["max_epochs"] = max_epochs
     base["model_type"] = base.get("model_type") or "FBPUNet"
@@ -928,8 +942,6 @@ def build_split_parser(
 ):
     """Build a concatenated parser for one split (train or valid)."""
     import hardpicks
-    import hardpicks.data.fbp.data_module as fbp_data_module
-
     parts: list = []
     backend = backend.strip().lower()
     if not site_names:
@@ -954,6 +966,8 @@ def build_split_parser(
                 )
             )
     elif backend == "hdf5":
+        from seismic_utils.hdf5_parser import create_hdf5_parser
+
         rejected = Path(hardpicks.FBP_BAD_GATHERS_DIR) / "bad-gather-ids_combined.yaml"
         if not rejected.is_file():
             rejected = None
@@ -975,7 +989,7 @@ def build_split_parser(
             for k, v in site_info.items():
                 logger.info("  %s: %s", k, v)
             parts.append(
-                fbp_data_module.FBPDataModule.create_parser(
+                create_hdf5_parser(
                     site_info=site_info,
                     site_params={
                         **hdf5_site_params,
@@ -1079,7 +1093,7 @@ def build_loaders(
         **worker_kwargs,
     )
     valid_loader = torch.utils.data.DataLoader(
-        dataset=valid_parser,
+        dataset=IndexedValidationDataset(valid_parser),
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
@@ -1459,10 +1473,13 @@ class ProgressMetricsCallback(pl.Callback):
 
 
 def _find_metrics_csv(csv_root: Path) -> Path:
-    candidates = sorted(csv_root.rglob("metrics.csv"))
+    candidates = list(csv_root.rglob("metrics.csv"))
     if not candidates:
         raise FileNotFoundError(f"No metrics.csv under {csv_root}")
-    return candidates[-1]
+    def version(path):
+        name = path.parent.name
+        return int(name.removeprefix("version_")) if name.removeprefix("version_").isdigit() else -1
+    return max(candidates, key=lambda path: (version(path), path.stat().st_mtime_ns))
 
 
 def _epoch_table(df: pd.DataFrame) -> pd.DataFrame:
@@ -1492,8 +1509,9 @@ def print_training_summary(
     batch_size: int,
     best_path: Optional[Path],
     best_score: Any,
+    metrics_csv: Optional[Path] = None,
 ) -> pd.DataFrame:
-    metrics_csv = _find_metrics_csv(csv_dir)
+    metrics_csv = metrics_csv or _find_metrics_csv(csv_dir)
     raw_metrics = pd.read_csv(metrics_csv)
     epoch_df = _epoch_table(raw_metrics)
     epoch_csv = output_root / "epoch_metrics.csv"
@@ -1730,16 +1748,23 @@ def _load_fbpunet_from_checkpoint(ckpt_path: Path):
         mlflow.log_param = orig
 
 
+class RunModelCheckpoint(pl.callbacks.ModelCheckpoint):
+    """Keep an explicit, portable best-file manifest alongside the checkpoints."""
+
+    def _save_checkpoint(self, trainer, filepath):
+        super()._save_checkpoint(trainer, filepath)
+        if trainer.is_global_zero and self.best_model_path:
+            _atomic_write_text(Path(self.dirpath) / "best_checkpoint.json", json.dumps({
+                "path": Path(self.best_model_path).name,
+                "metric": self.monitor,
+                "score": _metric_float(self.best_model_score),
+            }, indent=2) + "\n")
+
+
 def make_model_checkpoint(
     dirpath: Path | str, *, save_top_k: int = 1
 ) -> pl.callbacks.ModelCheckpoint:
-    """Save the top ``valid/HitRate1px`` checkpoints, overwriting same-name leftovers.
-
-    ``save_top_k=1`` keeps the single best file. ``save_top_k=-1`` writes a
-    checkpoint after every validation epoch. ``enable_version_counter=False``
-    avoids ``best-epoch=…-v1.ckpt`` when the output dir still has a previous
-    run's file with the same epoch/step name.
-    """
+    """Save top checkpoints without overwriting another run's files."""
     kwargs: Dict[str, Any] = dict(
         dirpath=str(dirpath),
         filename="best-{epoch:03d}-{step:06d}",
@@ -1747,28 +1772,32 @@ def make_model_checkpoint(
         mode="max",
         save_top_k=int(save_top_k),
     )
-    try:
-        return pl.callbacks.ModelCheckpoint(**kwargs, enable_version_counter=False)
-    except TypeError:
-        return pl.callbacks.ModelCheckpoint(**kwargs)
+    return RunModelCheckpoint(**kwargs)
 
 
 def validate_best_checkpoint(trainer: pl.Trainer, valid_loader, best_path: Path):
     """Re-run validation with best-checkpoint *weights* on the fitted module.
 
-    Do not construct a new ``FBPUNet`` and pass it into a trainer that already
-    ran ``fit()``. Lightning 2.x then mixes loop / BatchNorm / evaluator state,
-    and the report's "Final validation" no longer matches the in-training score
-    that ``ModelCheckpoint`` used to pick the file.
+    Reusing the module preserves its picker evaluators. A fresh model with the
+    same evaluators is equally valid; both require repeatable input preprocessing.
     """
     module = trainer.lightning_module
     if module is None:
         raise RuntimeError("validate_best_checkpoint requires a fitted trainer.lightning_module")
     ckpt_path = str(Path(best_path))
-    try:
-        return trainer.validate(module, dataloaders=valid_loader, ckpt_path=ckpt_path)
-    except TypeError:
-        return trainer.validate(module, val_dataloaders=valid_loader, ckpt_path=ckpt_path)
+    result = trainer.validate(module, dataloaders=valid_loader, ckpt_path=ckpt_path)
+    expected = getattr(module, "_checkpoint_validation_metrics", {})
+    if expected and result:
+        differences = {
+            key: (value, result[0].get(key)) for key, value in expected.items()
+            if key not in result[0] or not math.isclose(float(value), float(result[0][key]), rel_tol=1e-5, abs_tol=1e-6)
+        }
+        if differences:
+            raise RuntimeError(
+                f"Checkpoint revalidation mismatch (saved, recomputed): {differences}. "
+                "Verify dataset, preprocessing, batch size, and dependency versions."
+            )
+    return result
 
 
 def make_trainer(
@@ -1907,13 +1936,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         picker=args.picker,
         smooth_threshold=args.smooth_threshold,
     )
+    model_config["training_data"] = {
+        "preprocessing_version": PREPROCESSING_VERSION,
+        "train_sites": list(train_site_names), "valid_sites": list(valid_site_names),
+        "backend": args.backend, "eval_ratio": eval_ratio, "seed": args.seed,
+        "batch_size": args.batch_size, "precision": args.precision,
+        "site_params": dict(COMMON_SITE_PARAMS), "augmentations": args.train_augmentations,
+    }
+    if resume_ckpt:
+        validate_resume_checkpoint(load_checkpoint(resume_ckpt), model_config)
     model_slug = "".join(c if c.isalnum() or c in "-_" else "-" for c in model_label.lower())
 
     npz_root = args.npz_root or (args.data_dir / "npz")
     run_name = f"train_{site_label}_{model_slug}"
-    run_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_root = (args.output_dir or (REPO_ROOT / "output" / run_name)).resolve()
-    output_root.mkdir(parents=True, exist_ok=True)
+    run_stamp = run_token(datetime.now().strftime("%Y%m%d_%H%M%S_%f"))
+    output_root = (args.output_dir or (REPO_ROOT / "output" / f"{run_name}_{run_stamp}")).resolve()
+    if env_is_rank_zero():
+        reserve_run_directory(output_root)
+    else:
+        wait_for_run_directory(output_root)
 
     print("PL compat:", ensure_hardpicks_lightning_compat())
     if not hardpicks_available():
@@ -1952,6 +1993,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     getattr(args, "train_augmentations", None) or []
                 ),
                 "resume_ckpt": str(resume_ckpt) if resume_ckpt else None,
+                "init_ckpt": str(args.init_ckpt) if args.init_ckpt else None,
+                "preprocessing_version": PREPROCESSING_VERSION,
+                "torch_version": torch.__version__, "lightning_version": pl.__version__,
                 "backend": args.backend,
                 "output_dir": str(output_root),
                 "devices": args.devices,
@@ -1999,48 +2043,46 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print("DATA_BACKEND:", args.backend, "| NPZ_ROOT:", npz_root)
 
     config_out = output_root / "model_config.yaml"
-    with config_out.open("w") as f:
-        yaml.safe_dump(model_config, f, sort_keys=False, default_flow_style=False)
+    if rank_zero:
+        _atomic_write_text(config_out, yaml.safe_dump(model_config, sort_keys=False))
     print("Wrote", config_out)
 
     recipe_out = output_root / "train_recipe.yaml"
-    with recipe_out.open("w") as f:
-        yaml.safe_dump(
+    if rank_zero:
+        _atomic_write_text(recipe_out, yaml.safe_dump(
             {
                 "source": str(getattr(args, "train_config_path", "")),
                 **dict(getattr(args, "train_recipe", None) or {}),
                 "augmentations": getattr(args, "train_augmentations", None) or [],
             },
-            f,
             sort_keys=False,
             default_flow_style=False,
-        )
+        ))
     print("Wrote", recipe_out)
 
     split_out = output_root / "data_split.yaml"
-    with split_out.open("w") as f:
-        yaml.safe_dump(
+    if rank_zero:
+        _atomic_write_text(split_out, yaml.safe_dump(
             {
                 "fold": site_label if eval_ratio is None else None,
                 "train_sites": list(train_site_names),
                 "valid_sites": list(valid_site_names),
                 "eval_ratio": eval_ratio,
             },
-            f,
             sort_keys=False,
             default_flow_style=False,
-        )
+        ))
     print("Wrote", split_out)
 
     tbx_dir = output_root / "tensorboard"
     csv_dir = output_root / "csv_logs"
-    tbx_dir.mkdir(exist_ok=True)
-    csv_dir.mkdir(exist_ok=True)
+    tbx_dir.mkdir(parents=True, exist_ok=True)
+    csv_dir.mkdir(parents=True, exist_ok=True)
 
     tbx_logger = pl.loggers.TensorBoardLogger(
-        save_dir=str(tbx_dir), name="default", default_hp_metric=False
+        save_dir=str(tbx_dir), name="default", version=0, default_hp_metric=False
     )
-    csv_logger = pl.loggers.CSVLogger(save_dir=str(csv_dir), name="metrics")
+    csv_logger = pl.loggers.CSVLogger(save_dir=str(csv_dir), name="metrics", version=0)
     print("TensorBoard:", f"tensorboard --logdir {tbx_dir}")
 
     try:
@@ -2069,7 +2111,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         num_workers=args.num_workers,
         pin_memory=use_gpu,
         drop_last_train=n_devices > 1,
-        shuffle_train=n_devices <= 1,
+        shuffle_train=True,
     )
     print(
         f"Train batches: {len(train_loader)} | Valid batches: {len(valid_loader)} "
@@ -2083,6 +2125,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         report._write_markdown()
 
     model = fbp_unet.FBPUNet(model_config)
+    if args.init_ckpt:
+        init_checkpoint = load_checkpoint(resolve_checkpoint(args.init_ckpt))
+        if picker_from_hparams(init_checkpoint.get("hyper_parameters")) != picker_from_hparams(model_config):
+            raise ValueError("--init-ckpt picker differs from the requested task")
+        model.load_state_dict(init_checkpoint["state_dict"], strict=True)
     if str(model_config.get("picker") or "") == PICKER_BEFORE_AFTER:
         attach_smooth_evaluators(model, model_config)
     setattr(model, "_tbx_logger", tbx_logger)
@@ -2131,6 +2178,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         _batch = next(iter(train_loader))
         print("batch keys:", sorted(_batch.keys()))
         print("samples", tuple(_batch["samples"].shape), _batch["samples"].dtype)
+        del _batch
 
     print(f"Training for up to {args.epochs} epochs (patience={args.patience})…")
     trainer.fit(
@@ -2158,6 +2206,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             batch_size=args.batch_size,
             best_path=best_path,
             best_score=checkpoint_cb.best_model_score,
+            metrics_csv=Path(csv_logger.log_dir) / "metrics.csv",
         )
         curves_path = save_metric_curves(epoch_df, output_root, site_label)
         print("Saved", curves_path)
