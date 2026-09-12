@@ -415,8 +415,8 @@ def create_npz_parser(
         ``subset`` (``eval_ratio``, ``use_eval_split``, optional ``split_seed``),
         ``segm_first_break_buffer``, etc.
     """
-    from hardpicks.data.fbp.gather_preprocess import ShotLineGatherPreprocessor
     from hardpicks.data.fbp.gather_splitter import get_train_and_test_sub_datasets
+    from seismic_utils.gather_preprocess_local import wrap_gather_preprocessor
 
     site_params = dict(site_params or {})
     dataset = NpzShotLineGatherDataset.from_npz_root(
@@ -441,21 +441,23 @@ def create_npz_parser(
         "augmentations should *never* be activated in validation/testing!"
     )
 
-    parser = ShotLineGatherPreprocessor(
+    parser = wrap_gather_preprocessor(
         dataset,
-        normalize_samples=site_params.get("normalize_samples", None),
-        sample_norm_strategy=site_params.get("sample_norm_strategy", None),
-        normalize_offsets=site_params.get("normalize_offsets", None),
-        shot_to_rec_offset_norm_const=site_params.get("shot_to_rec_offset_norm_const", None),
-        rec_to_rec_offset_norm_const=site_params.get("rec_to_rec_offset_norm_const", None),
-        generate_first_break_prior_masks=site_params.get("generate_first_break_prior_masks", None),
-        first_break_prior_velocity_range=site_params.get("first_break_prior_velocity_range", None),
-        first_break_prior_offset_range=site_params.get("first_break_prior_offset_range", None),
-        generate_segm_masks=generate_segm_masks,
-        segm_class_count=segm_class_count,
-        segm_first_break_buffer=segm_first_break_buffer,
-        augmentations=augmentations,
-        linear_time_window=site_params.get("linear_time_window", None),
+        site_params=site_params,
+        extra_kwargs=dict(
+            normalize_samples=site_params.get("normalize_samples", None),
+            sample_norm_strategy=site_params.get("sample_norm_strategy", None),
+            normalize_offsets=site_params.get("normalize_offsets", None),
+            shot_to_rec_offset_norm_const=site_params.get("shot_to_rec_offset_norm_const", None),
+            rec_to_rec_offset_norm_const=site_params.get("rec_to_rec_offset_norm_const", None),
+            generate_first_break_prior_masks=site_params.get("generate_first_break_prior_masks", None),
+            first_break_prior_velocity_range=site_params.get("first_break_prior_velocity_range", None),
+            first_break_prior_offset_range=site_params.get("first_break_prior_offset_range", None),
+            generate_segm_masks=generate_segm_masks,
+            segm_class_count=segm_class_count,
+            segm_first_break_buffer=segm_first_break_buffer,
+            augmentations=augmentations,
+        ),
     )
 
     if "subset" in site_params:

@@ -8,15 +8,15 @@ import numpy as np
 import pytest
 
 from hardpicks.data.fbp.constants import BAD_FIRST_BREAK_PICK_INDEX
-from hardpicks.data.fbp.gather_transforms import (
+from hardpicks.data.fbp.gather_transforms import generate_segmentation_mask
+from hardpicks.models.constants import DONTCARE_SEGM_MASK_LABEL
+from seismic_utils.gather_border import (
     apply_linear_time_window,
-    generate_segmentation_mask,
     kill_traces,
     rebalance_offsets,
     reverse_polarity,
     unshift_sample_indices,
 )
-from hardpicks.models.constants import DONTCARE_SEGM_MASK_LABEL
 from train.fbp_train import (
     DEFAULT_LINEAR_TIME_WINDOW,
     linear_time_window_from_hparams,
@@ -204,7 +204,7 @@ def test_valid_parser_applies_window_without_augmentations(tiny_hdf5):
 
 
 def test_preprocessor_dispatches_new_aug_types():
-    from hardpicks.data.fbp.gather_preprocess import ShotLineGatherPreprocessor
+    from seismic_utils.gather_preprocess_local import LocalShotLineGatherPreprocessor
 
     gather = _gather(n_traces=8, offsets=np.linspace(50, 900, 8))
 
@@ -218,7 +218,7 @@ def test_preprocessor_dispatches_new_aug_types():
         def get_meta_gather(self, _idx):
             return copy.deepcopy(gather)
 
-    wrapped = ShotLineGatherPreprocessor(
+    wrapped = LocalShotLineGatherPreprocessor(
         dataset=_Dataset(),
         normalize_samples=False,
         normalize_offsets=False,

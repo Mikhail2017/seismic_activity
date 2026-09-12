@@ -21,7 +21,6 @@ class OwnedMetadataGatherDataset(ShotLineGatherDataset):
 def create_hdf5_parser(*, site_info, site_params, prefix, dataset_hyper_params, segm_class_count):
     """Local equivalent of FBPDataModule.create_parser with safe raw metadata."""
     from hardpicks.data.fbp.gather_cleaner import ShotLineGatherCleaner
-    from hardpicks.data.fbp.gather_preprocess import ShotLineGatherPreprocessor
     from hardpicks.data.fbp.gather_splitter import get_train_and_test_sub_datasets
 
     params = copy.deepcopy(site_params)
@@ -47,12 +46,17 @@ def create_hdf5_parser(*, site_info, site_params, prefix, dataset_hyper_params, 
         "shot_to_rec_offset_norm_const", "rec_to_rec_offset_norm_const",
         "generate_first_break_prior_masks", "first_break_prior_velocity_range",
         "first_break_prior_offset_range", "segm_first_break_buffer", "augmentations",
-        "linear_time_window",
     )
-    parser = ShotLineGatherPreprocessor(
-        parser, segm_class_count=segm_class_count,
-        generate_segm_masks=params.get("generate_segm_masks", bool(segm_class_count)),
-        **{key: params.get(key) for key in preprocess_keys},
+    from seismic_utils.gather_preprocess_local import wrap_gather_preprocessor
+
+    parser = wrap_gather_preprocessor(
+        parser,
+        site_params=params,
+        extra_kwargs={
+            "segm_class_count": segm_class_count,
+            "generate_segm_masks": params.get("generate_segm_masks", bool(segm_class_count)),
+            **{key: params.get(key) for key in preprocess_keys},
+        },
     )
     if "subset" in params:
         subset = params["subset"]

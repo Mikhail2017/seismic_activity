@@ -143,7 +143,7 @@ def _prepare_gather_for_inference(
 ) -> dict[str, Any]:
     """Normalize samples/offsets like training defaults (no full deepcopy)."""
     from hardpicks.data.fbp.gather_preprocess import ShotLineGatherPreprocessor
-    from hardpicks.data.fbp.gather_transforms import apply_linear_time_window
+    from seismic_utils.gather_border import apply_linear_time_window
 
     out = dict(gather)
     for key, val in list(out.items()):
@@ -194,7 +194,7 @@ def predict_first_breaks_ms(
     import hardpicks.data.fbp.data_module as fbp_data_module
     import hardpicks.models.fbp.utils as model_utils
 
-    from hardpicks.data.fbp.gather_transforms import unshift_sample_indices
+    from seismic_utils.gather_border import unshift_sample_indices
 
     from .pickers import picker_from_model
 
