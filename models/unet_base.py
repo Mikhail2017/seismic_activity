@@ -610,9 +610,18 @@ class UNet(model_base.BaseSegmModel):
         preds = self(input_tensor)  # calls the forward pass of the model
         assert self.segm_mask_field_name in batch, "forgot to generate the segmentation masks in preproc?"
         targets = batch[self.segm_mask_field_name].long()
-        loss = self.loss_fn(preds, targets)
+        from seismic_utils.validation import unique_validation_batch, loss_weight
+
+        metric_batch, keep = (batch, None) if self.training else unique_validation_batch(batch)
+        metric_preds = preds if keep is None else preds[keep]
+        loss_targets = targets if keep is None else targets[keep]
+        self._last_eval_loss_weight = loss_weight(self.loss_fn, loss_targets) if not self.training else 0.0
+        if not self.training and self._last_eval_loss_weight == 0:
+            loss = preds.sum() * 0
+        else:
+            loss = self.loss_fn(metric_preds, loss_targets)
         preds = preds.detach()  # anything else done with the preds should not affect the model
-        metrics = evaluator.ingest(batch, batch_idx, preds)
+        metrics = evaluator.ingest(metric_batch, batch_idx, metric_preds.detach()) if metric_batch["batch_size"] else {}
         return preds, loss, metrics
 
     def _check_input_tensor_pow2_size(self, x):

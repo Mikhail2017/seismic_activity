@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 from typing import Any
 
 import numpy as np
@@ -35,7 +36,7 @@ def resolve_checkpoint(
     *,
     ckpt_dir: str | Path | None = None,
 ) -> Path:
-    """Return an explicit ``.ckpt`` file, or the newest ``best*.ckpt`` under *ckpt_dir*."""
+    """Resolve an explicit file, the run's best manifest, or one unambiguous file."""
     if path:
         ckpt = Path(path).expanduser().resolve()
         if not ckpt.is_file():
@@ -46,10 +47,18 @@ def resolve_checkpoint(
     directory = Path(ckpt_dir).expanduser().resolve()
     if not directory.is_dir():
         raise FileNotFoundError(f"Checkpoint directory not found: {directory}")
-    matches = sorted(directory.glob("best*.ckpt"), key=lambda p: p.stat().st_mtime)
+    manifest = directory / "best_checkpoint.json"
+    if manifest.is_file():
+        selected = directory / Path(json.loads(manifest.read_text())["path"]).name
+        if not selected.is_file():
+            raise FileNotFoundError(f"Best-checkpoint manifest points to missing file: {selected}")
+        return selected.resolve()
+    matches = sorted(directory.glob("best*.ckpt"))
     if not matches:
         raise FileNotFoundError(f"No best*.ckpt under {directory}")
-    return matches[-1]
+    if len(matches) != 1:
+        raise FileNotFoundError(f"Multiple checkpoints under {directory}; specify --ckpt explicitly")
+    return matches[0]
 
 
 def load_fbp_model(ckpt_path: str | Path, *, device: str | None = None):

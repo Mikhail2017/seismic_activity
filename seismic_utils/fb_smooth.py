@@ -2,8 +2,9 @@
 
 Faithful numpy/torch port of ``_fb_smooth_result`` from geo-stack
 ``first_break_picking`` (not imported). Class map: ``0`` = before first break,
-``1`` = at/after. Isolated ``1`` pixels are skipped until a stable run of
-``threshold`` after-class samples is found.
+``1`` = at/after. The legacy rule compares two window sums; it does not
+guarantee a contiguous run of ``threshold`` after-class samples. It is kept
+for checkpoint compatibility rather than silently changing the picker.
 """
 
 from __future__ import annotations
@@ -39,7 +40,9 @@ def fb_smooth_result(
     n_samples, n_traces = arr.shape
     del n_samples
     picks = np.full(n_traces, _BAD_PICK, dtype=np.int64)
-    thr = max(int(threshold), 1)
+    thr = int(threshold)
+    if thr < 1:
+        raise ValueError("threshold must be positive")
     for i in range(n_traces):
         col = arr[:, i]
         ones = np.flatnonzero(col == 1)
@@ -59,7 +62,7 @@ def fb_smooth_result(
     return picks
 
 
-def fb_smooth_from_logits(raw_preds, *, threshold: int = DEFAULT_SMOOTH_THRESHOLD):
+def fb_smooth_from_logits(raw_preds, *, threshold: int = DEFAULT_SMOOTH_THRESHOLD, sample_counts=None):
     """Decode UNet logits ``(B, C, n_traces, n_samples)`` → pick indices + after-class prob.
 
     Returns ``(picks, probabilities)`` as tensors on the same device as *raw_preds*.
@@ -77,8 +80,14 @@ def fb_smooth_from_logits(raw_preds, *, threshold: int = DEFAULT_SMOOTH_THRESHOL
     batch_size, n_traces, n_samples = class_map.shape
     pred_np = class_map.detach().cpu().numpy()
     pick_np = np.zeros((batch_size, n_traces), dtype=np.int64)
+    if sample_counts is None:
+        counts = [n_samples] * batch_size
+    else:
+        counts = torch.as_tensor(sample_counts).reshape(-1).tolist()
+        if len(counts) != batch_size or any(int(n) <= 0 or int(n) > n_samples for n in counts):
+            raise ValueError("sample_counts must contain the unpadded length of every gather")
     for b in range(batch_size):
-        pick_np[b] = fb_smooth_result(pred_np[b].T, threshold=threshold)
+        pick_np[b] = fb_smooth_result(pred_np[b, :, :int(counts[b])].T, threshold=threshold)
 
     device = raw_preds.device
     picks = torch.from_numpy(pick_np).to(device=device, dtype=torch.long)

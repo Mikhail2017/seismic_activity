@@ -13,7 +13,7 @@ import importlib
 import typing
 
 _APPLIED_MODULES: dict[str, int] = {}
-_COMPAT_VERSION = 2  # bump when patch behavior changes
+_COMPAT_VERSION = 4  # restart Python after upgrading an already-patched module
 
 
 def _patch_numpy_nan_alias() -> None:
@@ -201,16 +201,7 @@ def _patch_base_model_module(module_name: str) -> str:
         )
 
     if prev:
-        BaseModel.on_train_epoch_start = on_train_epoch_start
-        BaseModel.on_validation_epoch_start = on_validation_epoch_start
-        BaseModel.on_test_epoch_start = on_test_epoch_start
-        BaseModel.on_train_epoch_end = on_train_epoch_end
-        BaseModel.on_validation_epoch_end = on_validation_epoch_end
-        BaseModel.on_test_epoch_end = on_test_epoch_end
-        _strip_removed_hooks(BaseModel)
-        BaseModel._seismic_pl2_compat = _COMPAT_VERSION
-        _APPLIED_MODULES[module_name] = _COMPAT_VERSION
-        return f"{module_name}:pl-{pl.__version__}-upgraded-v{_COMPAT_VERSION}"
+        raise RuntimeError("Restart Python before upgrading the Lightning compatibility patch")
 
     _orig_init = BaseModel.__init__
     _orig_train_step = BaseModel.training_step
@@ -230,13 +221,17 @@ def _patch_base_model_module(module_name: str) -> str:
     def validation_step(self, batch, batch_idx):
         out = _orig_val_step(self, batch, batch_idx)
         loss = out["loss"] if isinstance(out, dict) else out
-        self._epoch_losses.setdefault("valid", []).append(loss.detach())
+        # The upstream hardpicks BaseModel still expects tensors, not weighted
+        # pairs. Only the local model returns the additional loss_weight field.
+        item = (loss.detach(), out["loss_weight"]) if isinstance(out, dict) and "loss_weight" in out else loss.detach()
+        self._epoch_losses.setdefault("valid", []).append(item)
         return out
 
     def test_step(self, batch, batch_idx):
         out = _orig_test_step(self, batch, batch_idx)
         loss = out["loss"] if isinstance(out, dict) else out
-        self._epoch_losses.setdefault("test", []).append(loss.detach())
+        item = (loss.detach(), out["loss_weight"]) if isinstance(out, dict) and "loss_weight" in out else loss.detach()
+        self._epoch_losses.setdefault("test", []).append(item)
         return out
 
     BaseModel.__init__ = __init__
