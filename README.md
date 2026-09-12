@@ -192,7 +192,7 @@ After training, score a checkpoint on the fold (or site) validation split and wr
 headline metrics, error histograms, offset slices, and worst/typical gather overlays:
 
 ```bash
-python train/fbp_eval.py --ckpt-dir output/train_foldA_resnet34 --fold A --backend hdf5
+python train/fbp_eval.py --ckpt-dir output/train_foldA_resnet34 --fold A --backend hdf5 --rmse-above 7
 python train/fbp_eval.py --ckpt-dir /path/to/weights/baseline/foldA --fold A --backend hdf5 --data-dir /tmp/data/
 python train/fbp_eval.py --ckpt output/train_foldA_resnet34/best-epoch=013-step=015232.ckpt --fold A --backend npz
 ```

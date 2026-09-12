@@ -7,7 +7,7 @@ embeds hyperparams), runs the fold/site validation set, and writes:
     report/eval_<label>_<YYYYMMDD_HHMMSS>/
       report.md  index.html  stats.html  worst.html  typical.html
       metrics.json  traces.parquet (or traces.csv.gz)
-      figs/worst_*.png  figs/typical_*.png
+      figs/worst_*.png  figs/typical_*.png  figs/high_rmse_*.png
 
 Example::
 
@@ -16,7 +16,7 @@ Example::
     python train/fbp_eval.py --ckpt output/train_foldA_resnet34/best-epoch=013-step=015232.ckpt \\
         --fold A --backend npz
     python train/fbp_eval.py --picker before_after --ckpt-dir output/train_foldA_resnet34-before-after \\
-        --fold A --backend hdf5
+        --fold A --backend hdf5 --rmse-above 7
 """
 
 from __future__ import annotations
@@ -48,6 +48,7 @@ from seismic_utils.fbp_eval_report import (
     headline_metrics,
     offset_bin_table,
     pick_gallery_gathers,
+    pick_high_rmse_gathers,
     plot_gather_residual,
     write_index_html,
     write_report_md,
@@ -132,6 +133,16 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     p.add_argument("--n-worst", type=int, default=8, help="Worst gathers to plot.")
     p.add_argument("--n-typical", type=int, default=4, help="Typical/good gathers to plot.")
+    p.add_argument(
+        "--rmse-above",
+        type=float,
+        default=None,
+        metavar="SAMPLES",
+        help=(
+            "Plot every gather whose RMSE (samples) is strictly greater than this "
+            "value, overlaying reference and prediction. Omit to skip."
+        ),
+    )
     p.add_argument("--report-dir", type=Path, default=None, help="Report root (default: <repo>/report).")
     p.add_argument(
         "--smooth-threshold",
@@ -147,6 +158,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     args = p.parse_args(argv)
     if not args.list_folds and args.ckpt is None and args.ckpt_dir is None:
         p.error("Provide --ckpt or --ckpt-dir")
+    if args.rmse_above is not None and not np.isfinite(args.rmse_above):
+        p.error("--rmse-above must be a finite number")
     return args
 
 
@@ -366,6 +379,7 @@ def plot_gallery(
         rel = f"figs/{name}"
         subtitle = (
             f"{origin}  gather={int(row.GatherId)} shot={int(row.ShotId)} "
+            f"RMSE={getattr(row, 'RMSE', float('nan')):.3g} "
             f"MAE={getattr(row, 'MAE', float('nan')):.3g} "
             f"HR@1={getattr(row, 'HitRate1px', float('nan')):.3f} "
             f"P90={getattr(row, 'P90AbsError', float('nan')):.3g}"
@@ -376,6 +390,7 @@ def plot_gallery(
                 "image": rel,
                 "label": f"{origin} g{int(row.GatherId)} shot={int(row.ShotId)}",
                 "stats": (
+                    f"RMSE={getattr(row, 'RMSE', float('nan')):.4g} samples  "
                     f"MAE={getattr(row, 'MAE', float('nan')):.4g} samples  "
                     f"HR@1={getattr(row, 'HitRate1px', float('nan')):.4f}  "
                     f"n_labeled={int(getattr(row, 'n_labeled', 0))}"
@@ -506,6 +521,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     worst_df, typical_df = pick_gallery_gathers(
         gather_df, n_worst=args.n_worst, n_typical=args.n_typical
     )
+    high_rmse_df = (
+        pick_high_rmse_gathers(gather_df, args.rmse_above)
+        if args.rmse_above is not None
+        else gather_df.iloc[0:0].copy()
+    )
 
     encoder = str(hp.get("unet_encoder_type") or "model")
     if resolved_picker == PICKER_BEFORE_AFTER and "before-after" not in encoder.lower():
@@ -544,10 +564,35 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         prefix="typical",
         dt_by_origin=dt_by_origin,
     )
+    high_rmse_cards: List[Dict[str, Any]] = []
+    if args.rmse_above is not None:
+        print(
+            f"High-RMSE gallery: {len(high_rmse_df)} gather(s) with RMSE > {args.rmse_above} samples"
+        )
+        if len(high_rmse_df) > 200:
+            logger.warning(
+                "Plotting %d high-RMSE gathers; this can take a while and use a lot of disk",
+                len(high_rmse_df),
+            )
+        high_rmse_cards = plot_gallery(
+            high_rmse_df,
+            parser=parser,
+            gather_index=gather_index,
+            traces=traces,
+            figs_dir=figs_dir,
+            prefix="high_rmse",
+            dt_by_origin=dt_by_origin,
+        )
 
     write_stats_html(traces, metrics, offset_df, gather_df, report_dir / "stats.html")
     write_worst_html(worst_cards, report_dir / "worst.html", title="Worst residual gathers")
     write_worst_html(typical_cards, report_dir / "typical.html", title="Typical gathers")
+    if args.rmse_above is not None:
+        write_worst_html(
+            high_rmse_cards,
+            report_dir / "high_rmse.html",
+            title=f"Gathers with RMSE > {args.rmse_above} samples (reference + prediction)",
+        )
     meta = {
         "run_name": run_name,
         "picker": resolved_picker,
@@ -558,6 +603,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "fold": site_label if args.fold else None,
         "backend": args.backend,
         "smooth_threshold": metrics.get("smooth_threshold"),
+        "rmse_above": args.rmse_above,
     }
     write_report_md(
         report_dir / "report.md",
@@ -566,19 +612,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         offset_df=offset_df,
         worst_names=[c["image"] for c in worst_cards],
         typical_names=[c["image"] for c in typical_cards],
+        high_rmse_names=[c["image"] for c in high_rmse_cards],
     )
+    links = {
+        "Markdown report": "report.md",
+        "Plotly statistics": "stats.html",
+        "Worst gathers": "worst.html",
+        "Typical gathers": "typical.html",
+        "Trace table": traces_path.name,
+        "metrics.json": "metrics.json",
+    }
+    if args.rmse_above is not None:
+        links[f"High-RMSE gathers (>{args.rmse_above})"] = "high_rmse.html"
     write_index_html(
         report_dir / "index.html",
         title=f"FBP validation — {run_name}",
         metrics=metrics,
-        links={
-            "Markdown report": "report.md",
-            "Plotly statistics": "stats.html",
-            "Worst gathers": "worst.html",
-            "Typical gathers": "typical.html",
-            "Trace table": traces_path.name,
-            "metrics.json": "metrics.json",
-        },
+        links=links,
     )
 
     print("\nHeadline:")
