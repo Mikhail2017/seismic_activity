@@ -13,7 +13,8 @@ import importlib
 import typing
 
 _APPLIED_MODULES: dict[str, int] = {}
-_COMPAT_VERSION = 4  # restart Python after upgrading an already-patched module
+_COMPAT_VERSION = 5  # restart Python after upgrading an already-patched module
+_FBP_EVAL_HITRATE_PATCHED = False
 
 
 def _patch_numpy_nan_alias() -> None:
@@ -251,6 +252,53 @@ def _patch_base_model_module(module_name: str) -> str:
     return f"{module_name}:pl-{pl.__version__}-patched-v{_COMPAT_VERSION}"
 
 
+def _patch_fbp_evaluator_hitrate() -> None:
+    """Avoid pandas FutureWarning / future TypeError in HitRate summarization.
+
+    Upstream hardpicks does ``bool_series[nan_mask] = np.nan``. Pandas 2 rejects
+    that (incompatible with bool). Compute HitRate on labeled traces only.
+    """
+    global _FBP_EVAL_HITRATE_PATCHED
+    if _FBP_EVAL_HITRATE_PATCHED:
+        return
+    try:
+        from hardpicks.metrics.fbp.evaluator import FBPEvaluator
+    except ModuleNotFoundError:
+        return
+
+    orig = FBPEvaluator._summarize_dataframe
+
+    def _summarize_dataframe(self, dataframe):
+        hitrate_items = {
+            name: spec
+            for name, spec in self.metrics_metamap.items()
+            if spec[0] == "HitRate"
+        }
+        if not hitrate_items:
+            return orig(self, dataframe)
+        saved = self.metrics_metamap
+        self.metrics_metamap = {
+            name: spec for name, spec in saved.items() if spec[0] != "HitRate"
+        }
+        try:
+            output = orig(self, dataframe)
+        finally:
+            self.metrics_metamap = saved
+        labeled = dataframe["Errors"].notna()
+        tot_count = int(labeled.sum())
+        for metric_name, (_, metric_params) in hitrate_items.items():
+            if tot_count <= 0:
+                continue
+            hit_count = int(
+                (dataframe.loc[labeled, "Errors"].abs() < metric_params["buffer_size_px"]).sum()
+            )
+            output[metric_name] = hit_count / tot_count
+        return output
+
+    FBPEvaluator._summarize_dataframe = _summarize_dataframe
+    _FBP_EVAL_HITRATE_PATCHED = True
+
+
 def ensure_hardpicks_lightning_compat() -> str:
     """Stub removed PL types and rewrite epoch-end hooks for PL 2.x.
 
@@ -258,6 +306,7 @@ def ensure_hardpicks_lightning_compat() -> str:
     when available. Returns a short status string for logging.
     """
     _patch_numpy_nan_alias()
+    _patch_fbp_evaluator_hitrate()
 
     import pytorch_lightning.utilities.types as pl_types
 
