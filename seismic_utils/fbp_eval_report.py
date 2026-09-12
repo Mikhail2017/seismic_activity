@@ -15,6 +15,7 @@ import pandas as pd
 from .dataset import ShotGather
 
 HIT_BUFFERS_PX = (1, 3, 5, 7, 9)
+MIN_GALLERY_LABELED = 8
 
 
 def origin_name_map(origin_id_map: Dict[str, int]) -> Dict[int, str]:
@@ -183,16 +184,37 @@ def gather_summary(df: pd.DataFrame) -> pd.DataFrame:
     return grouped.agg(**agg).reset_index()
 
 
+def eligible_gallery_gathers(
+    gather_df: pd.DataFrame,
+    *,
+    min_labeled: int = MIN_GALLERY_LABELED,
+) -> pd.DataFrame:
+    """Gathers with a finite MAE and enough labeled traces to rank or plot."""
+    if gather_df.empty:
+        return gather_df.iloc[0:0].copy()
+    ranked = gather_df.dropna(subset=["MAE"]).copy()
+    if ranked.empty:
+        return ranked
+    min_labeled = int(min_labeled)
+    if min_labeled > 0 and "n_labeled" in ranked.columns:
+        ranked = ranked.loc[ranked["n_labeled"] >= min_labeled].copy()
+    return ranked
+
+
 def pick_gallery_gathers(
     gather_df: pd.DataFrame,
     *,
     n_worst: int = 8,
     n_typical: int = 4,
+    min_labeled: int = MIN_GALLERY_LABELED,
+    n_worst_candidates: int | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    ranked = gather_df.dropna(subset=["MAE"]).copy()
+    ranked = eligible_gallery_gathers(gather_df, min_labeled=min_labeled)
     if ranked.empty:
         return ranked, ranked
-    worst = ranked.sort_values(["P90AbsError", "MAE"], ascending=False).head(int(n_worst))
+    n_worst = int(n_worst)
+    n_cand = int(n_worst_candidates) if n_worst_candidates is not None else max(n_worst * 4, n_worst)
+    worst = ranked.sort_values(["P90AbsError", "MAE"], ascending=False).head(n_cand)
     remaining = ranked.drop(index=worst.index, errors="ignore")
     if remaining.empty:
         remaining = ranked
@@ -206,14 +228,31 @@ def pick_gallery_gathers(
     return worst, typical
 
 
-def pick_high_rmse_gathers(gather_df: pd.DataFrame, rmse_above: float) -> pd.DataFrame:
-    """Every labeled gather whose RMSE (samples) is strictly greater than *rmse_above*."""
+def pick_high_rmse_gathers(
+    gather_df: pd.DataFrame,
+    rmse_above: float,
+    *,
+    min_labeled: int = MIN_GALLERY_LABELED,
+) -> pd.DataFrame:
+    """Every sufficiently labeled gather whose RMSE (samples) is strictly greater than *rmse_above*."""
     if gather_df.empty or "RMSE" not in gather_df.columns:
         return gather_df.iloc[0:0].copy()
     ranked = gather_df.dropna(subset=["RMSE"]).copy()
+    min_labeled = int(min_labeled)
+    if min_labeled > 0 and "n_labeled" in ranked.columns:
+        ranked = ranked.loc[ranked["n_labeled"] >= min_labeled]
     selected = ranked.loc[ranked["RMSE"] > float(rmse_above)]
     cols = [c for c in ("RMSE", "MAE") if c in selected.columns]
     return selected.sort_values(cols, ascending=False)
+
+
+def has_finite_residual(gather: ShotGather, pred_ms: np.ndarray) -> bool:
+    """True when at least one trace has both a finite prediction and a finite reference."""
+    pred = np.asarray(pred_ms, dtype=np.float64).reshape(-1)
+    if pred.shape[0] != gather.n_traces:
+        return False
+    residual = pred - gather.first_breaks_ms
+    return bool(np.any(np.isfinite(residual)))
 
 
 def write_trace_table(df: pd.DataFrame, path: Path) -> Path:

@@ -45,8 +45,10 @@ for path in (str(REPO_ROOT), str(TRAIN_DIR)):
 
 from seismic_utils.dataset import DEFAULT_DATA_DIR
 from seismic_utils.fbp_eval_report import (
+    MIN_GALLERY_LABELED,
     annotate_trace_frame,
     gather_summary,
+    has_finite_residual,
     headline_metrics,
     offset_bin_table,
     pick_gallery_gathers,
@@ -136,6 +138,15 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--n-worst", type=int, default=8, help="Worst gathers to plot.")
     p.add_argument("--n-typical", type=int, default=4, help="Typical/good gathers to plot.")
     p.add_argument(
+        "--min-labeled",
+        type=int,
+        default=MIN_GALLERY_LABELED,
+        help=(
+            "Minimum labeled traces for a gather to appear in the worst / typical / "
+            "high-RMSE galleries. Sparse or unlabeled gathers are dropped."
+        ),
+    )
+    p.add_argument(
         "--rmse-above",
         type=float,
         default=None,
@@ -162,6 +173,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         p.error("Provide --ckpt or --ckpt-dir")
     if args.rmse_above is not None and not np.isfinite(args.rmse_above):
         p.error("--rmse-above must be a finite number")
+    if args.min_labeled < 0:
+        p.error("--min-labeled must be >= 0")
     return args
 
 
@@ -374,10 +387,13 @@ def plot_gallery(
     figs_dir: Path,
     prefix: str,
     dt_by_origin: Dict[str, float],
+    limit: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     figs_dir.mkdir(parents=True, exist_ok=True)
     cards: List[Dict[str, Any]] = []
-    for i, row in enumerate(rows.itertuples(index=False), start=1):
+    for row in rows.itertuples(index=False):
+        if limit is not None and len(cards) >= int(limit):
+            break
         origin = str(getattr(row, "Origin", ""))
         parser_idx = lookup_parser_index(
             gather_index, origin, int(row.GatherId), int(row.ShotId)
@@ -402,14 +418,26 @@ def plot_gallery(
             or lookup_origin_rate(origin, dt_by_origin, gdf["SampleRateMs"].iloc[0] if len(gdf) else 2.0)
         )
         pred_ms = pred_ms_for_gather(item, gdf, dt)
-        name = f"{prefix}_{i:02d}_g{int(row.GatherId)}_s{int(row.ShotId)}.png"
+        n_labeled = int(getattr(row, "n_labeled", 0))
+        if not has_finite_residual(gather, pred_ms):
+            logger.warning(
+                "skipping %s g%s s%s: no finite residual to plot (n_labeled=%s)",
+                origin,
+                row.GatherId,
+                row.ShotId,
+                n_labeled,
+            )
+            continue
+        plotted = len(cards) + 1
+        name = f"{prefix}_{plotted:02d}_g{int(row.GatherId)}_s{int(row.ShotId)}.png"
         rel = f"figs/{name}"
         subtitle = (
             f"{origin}  gather={int(row.GatherId)} shot={int(row.ShotId)} "
             f"RMSE={getattr(row, 'RMSE', float('nan')):.3g} "
             f"MAE={getattr(row, 'MAE', float('nan')):.3g} "
             f"HR@1={getattr(row, 'HitRate1px', float('nan')):.3f} "
-            f"P90={getattr(row, 'P90AbsError', float('nan')):.3g}"
+            f"P90={getattr(row, 'P90AbsError', float('nan')):.3g} "
+            f"n_labeled={n_labeled}"
         )
         plot_gather_residual(gather, pred_ms, figs_dir / name, subtitle=subtitle)
         cards.append(
@@ -420,7 +448,7 @@ def plot_gallery(
                     f"RMSE={getattr(row, 'RMSE', float('nan')):.4g} samples  "
                     f"MAE={getattr(row, 'MAE', float('nan')):.4g} samples  "
                     f"HR@1={getattr(row, 'HitRate1px', float('nan')):.4f}  "
-                    f"n_labeled={int(getattr(row, 'n_labeled', 0))}"
+                    f"n_labeled={n_labeled}"
                 ),
             }
         )
@@ -560,11 +588,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     }
     offset_df = offset_bin_table(traces)
     gather_df = gather_summary(traces)
+    n_with_mae = int(gather_df["MAE"].notna().sum()) if "MAE" in gather_df.columns else 0
     worst_df, typical_df = pick_gallery_gathers(
-        gather_df, n_worst=args.n_worst, n_typical=args.n_typical
+        gather_df,
+        n_worst=args.n_worst,
+        n_typical=args.n_typical,
+        min_labeled=args.min_labeled,
     )
+    if "n_labeled" in gather_df.columns and args.min_labeled > 0:
+        n_eligible = int(
+            ((gather_df["MAE"].notna()) & (gather_df["n_labeled"] >= args.min_labeled)).sum()
+        )
+        dropped = n_with_mae - n_eligible
+        if dropped:
+            logger.info(
+                "Gallery: dropped %d gather(s) with n_labeled < %d",
+                dropped,
+                args.min_labeled,
+            )
     high_rmse_df = (
-        pick_high_rmse_gathers(gather_df, args.rmse_above)
+        pick_high_rmse_gathers(gather_df, args.rmse_above, min_labeled=args.min_labeled)
         if args.rmse_above is not None
         else gather_df.iloc[0:0].copy()
     )
@@ -596,6 +639,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         figs_dir=figs_dir,
         prefix="worst",
         dt_by_origin=dt_by_origin,
+        limit=args.n_worst,
     )
     typical_cards = plot_gallery(
         typical_df,
@@ -605,6 +649,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         figs_dir=figs_dir,
         prefix="typical",
         dt_by_origin=dt_by_origin,
+        limit=args.n_typical,
     )
     high_rmse_cards: List[Dict[str, Any]] = []
     if args.rmse_above is not None:
