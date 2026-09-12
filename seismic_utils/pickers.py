@@ -187,7 +187,7 @@ def _smooth_evaluator_class():
             assert len(batch["rec_ids"]) == len(batch["offset_distances"])
 
             regr_preds, probabilities_of_fbp = fb_smooth_from_logits(
-                raw_preds, threshold=self.smooth_threshold
+                raw_preds, threshold=self.smooth_threshold, sample_counts=batch.get("sample_count")
             )
             if self.extract_fbp_probability:
                 assert probabilities_of_fbp is not None, "probabilities_of_fbp is None"
