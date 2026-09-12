@@ -475,6 +475,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         use_eval_split=bool(eval_ratio),
         segm_class_count=int(hp["segm_class_count"]),
         first_break_prior=bool(getattr(model, "use_first_break_prior", False)),
+        linear_time_window=train_cli.linear_time_window_from_hparams(hp),
     )
     collate_fn = functools.partial(
         fbp_data_module.fbp_batch_collate,

@@ -12,7 +12,7 @@ import torch
 from seismic_utils.pickers import picker_from_hparams
 
 
-PREPROCESSING_VERSION = "owned-hdf5-metadata-v1"
+PREPROCESSING_VERSION = "border-aware-preprocess-v1"
 
 
 def load_checkpoint(path):

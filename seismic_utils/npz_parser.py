@@ -455,6 +455,7 @@ def create_npz_parser(
         segm_class_count=segm_class_count,
         segm_first_break_buffer=segm_first_break_buffer,
         augmentations=augmentations,
+        linear_time_window=site_params.get("linear_time_window", None),
     )
 
     if "subset" in site_params:

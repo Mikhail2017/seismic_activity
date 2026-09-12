@@ -47,6 +47,7 @@ def create_hdf5_parser(*, site_info, site_params, prefix, dataset_hyper_params, 
         "shot_to_rec_offset_norm_const", "rec_to_rec_offset_norm_const",
         "generate_first_break_prior_masks", "first_break_prior_velocity_range",
         "first_break_prior_offset_range", "segm_first_break_buffer", "augmentations",
+        "linear_time_window",
     )
     parser = ShotLineGatherPreprocessor(
         parser, segm_class_count=segm_class_count,

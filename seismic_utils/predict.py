@@ -136,11 +136,23 @@ def shot_gather_to_inference_dict(
     }
 
 
-def _prepare_gather_for_inference(gather: dict[str, Any]) -> dict[str, Any]:
+def _prepare_gather_for_inference(
+    gather: dict[str, Any],
+    *,
+    linear_time_window: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Normalize samples/offsets like training defaults (no full deepcopy)."""
     from hardpicks.data.fbp.gather_preprocess import ShotLineGatherPreprocessor
+    from hardpicks.data.fbp.gather_transforms import apply_linear_time_window
 
     out = dict(gather)
+    for key, val in list(out.items()):
+        if isinstance(val, np.ndarray):
+            out[key] = val.copy()
+    if linear_time_window and linear_time_window.get("enabled"):
+        params = dict(linear_time_window)
+        params.pop("enabled", None)
+        apply_linear_time_window(out, **params)
     out["samples"] = ShotLineGatherPreprocessor.normalize_sample_with_tracewise_abs_max_strategy(
         np.asarray(out["samples"], dtype=np.float32)
     )
@@ -150,6 +162,16 @@ def _prepare_gather_for_inference(gather: dict[str, Any]) -> dict[str, Any]:
         offsets[:, 1:] *= 1.0 / 50.0
         out["offset_distances"] = offsets
     return out
+
+
+def _linear_time_window_from_model(model) -> dict[str, Any] | None:
+    hp = dict(getattr(model, "hparams", {}) or {})
+    td = hp.get("training_data") if isinstance(hp, dict) else None
+    site_params = (td or {}).get("site_params") if isinstance(td, dict) else None
+    raw = (site_params or {}).get("linear_time_window") if isinstance(site_params, dict) else None
+    if not isinstance(raw, dict) or not raw.get("enabled"):
+        return None
+    return dict(raw)
 
 
 def predict_first_breaks_ms(
@@ -172,9 +194,14 @@ def predict_first_breaks_ms(
     import hardpicks.data.fbp.data_module as fbp_data_module
     import hardpicks.models.fbp.utils as model_utils
 
+    from hardpicks.data.fbp.gather_transforms import unshift_sample_indices
+
     from .pickers import picker_from_model
 
-    prepared = _prepare_gather_for_inference(hardpicks_gather)
+    window_cfg = _linear_time_window_from_model(model)
+    prepared = _prepare_gather_for_inference(
+        hardpicks_gather, linear_time_window=window_cfg
+    )
     n_traces = int(prepared["trace_count"])
     dt_ms = float(prepared["sample_rate_ms"])
     resolved_picker = picker or picker_from_model(model)
@@ -192,6 +219,9 @@ def predict_first_breaks_ms(
         )
 
     idx = pred_idx[0, :n_traces].detach().cpu().numpy().astype(np.float64)
+    shift = prepared.get("sample_time_shift")
+    if shift is not None:
+        idx = unshift_sample_indices(idx, np.asarray(shift)[:n_traces])
     fb_ms = idx * dt_ms
     fb_ms[idx <= 0] = np.nan
     return fb_ms

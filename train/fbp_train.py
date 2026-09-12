@@ -221,6 +221,14 @@ COMMON_SITE_PARAMS = {
     "segm_first_break_buffer": 0,
 }
 
+DEFAULT_LINEAR_TIME_WINDOW: Dict[str, Any] = {
+    "enabled": False,
+    "half_window_samples": 512,
+    "min_control_picks": 2,
+    "unlabeled_fallback": "skip",
+    "fallback_velocity_mps": 5500,
+}
+
 # Keys that belong to train-script CLI / presets but are not FBPUNet hyperparams.
 _MODEL_CONFIG_META_KEYS = frozenset({"lr", "model_name", "preset"})
 
@@ -299,6 +307,52 @@ def resolve_train_augmentations(recipe: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 def _aug_type_names(augmentations: Sequence[Dict[str, Any]]) -> List[str]:
     return [str(op.get("type", "?")) for op in augmentations]
+
+
+def resolve_linear_time_window(recipe: Dict[str, Any]) -> Dict[str, Any]:
+    """Train+val linear time-window preprocess from the recipe YAML.
+
+    Missing / null → disabled defaults. Unknown keys are rejected.
+    """
+    out = copy.deepcopy(DEFAULT_LINEAR_TIME_WINDOW)
+    raw = recipe.get("linear_time_window")
+    if raw is None:
+        return out
+    if not isinstance(raw, dict):
+        raise SystemExit("train config 'linear_time_window' must be a mapping or null")
+    unknown = sorted(set(raw) - set(DEFAULT_LINEAR_TIME_WINDOW))
+    if unknown:
+        raise SystemExit(
+            "train config linear_time_window has unknown keys: " + ", ".join(unknown)
+        )
+    out.update(copy.deepcopy(raw))
+    out["enabled"] = bool(out.get("enabled", False))
+    out["half_window_samples"] = int(out["half_window_samples"])
+    out["min_control_picks"] = int(out["min_control_picks"])
+    out["unlabeled_fallback"] = str(out["unlabeled_fallback"]).strip().lower()
+    out["fallback_velocity_mps"] = float(out["fallback_velocity_mps"])
+    if out["half_window_samples"] <= 0:
+        raise SystemExit("linear_time_window.half_window_samples must be > 0")
+    if out["min_control_picks"] < 1:
+        raise SystemExit("linear_time_window.min_control_picks must be >= 1")
+    if out["unlabeled_fallback"] not in ("skip", "velocity"):
+        raise SystemExit("linear_time_window.unlabeled_fallback must be 'skip' or 'velocity'")
+    if out["fallback_velocity_mps"] <= 0:
+        raise SystemExit("linear_time_window.fallback_velocity_mps must be > 0")
+    return out
+
+
+def linear_time_window_from_hparams(hp: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Return enabled window config from checkpoint / model hparams, else None."""
+    if not hp:
+        return None
+    td = hp.get("training_data") if isinstance(hp, dict) else None
+    site_params = (td or {}).get("site_params") if isinstance(td, dict) else None
+    raw = (site_params or {}).get("linear_time_window") if isinstance(site_params, dict) else None
+    if not isinstance(raw, dict):
+        return None
+    cfg = resolve_linear_time_window({"linear_time_window": raw})
+    return cfg if cfg.get("enabled") else None
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
@@ -551,6 +605,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     args.train_recipe = recipe
     args.train_config_path = config_path
     args.train_augmentations = resolve_train_augmentations(recipe)
+    args.linear_time_window = resolve_linear_time_window(recipe)
     if int(args.save_top_k) < -1:
         p.error("--save-top-k must be -1 (every epoch) or >= 0")
     args.save_top_k = int(args.save_top_k)
@@ -906,10 +961,13 @@ def _site_params(
     use_eval_split: bool,
     augmentations: Optional[Sequence[Dict[str, Any]]] = None,
     first_break_prior: bool = False,
+    linear_time_window: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     params: Dict[str, Any] = dict(COMMON_SITE_PARAMS)
     if first_break_prior:
         params["generate_first_break_prior_masks"] = True
+    if linear_time_window and linear_time_window.get("enabled"):
+        params["linear_time_window"] = copy.deepcopy(linear_time_window)
     if augment:
         ops = (
             list(augmentations)
@@ -939,6 +997,7 @@ def build_split_parser(
     segm_class_count: int = SEGMENTATION_CLASS_COUNT,
     augmentations: Optional[Sequence[Dict[str, Any]]] = None,
     first_break_prior: bool = False,
+    linear_time_window: Optional[Dict[str, Any]] = None,
 ):
     """Build a concatenated parser for one split (train or valid)."""
     import hardpicks
@@ -961,6 +1020,7 @@ def build_split_parser(
                         use_eval_split=use_eval_split,
                         augmentations=augmentations,
                         first_break_prior=first_break_prior,
+                        linear_time_window=linear_time_window,
                     ),
                     segm_class_count=segm_class_count,
                 )
@@ -999,6 +1059,7 @@ def build_split_parser(
                             use_eval_split=use_eval_split,
                             augmentations=augmentations,
                             first_break_prior=first_break_prior,
+                            linear_time_window=linear_time_window,
                         ),
                     },
                     prefix=prefix,
@@ -1024,6 +1085,7 @@ def build_parsers(
     segm_class_count: int = SEGMENTATION_CLASS_COUNT,
     augmentations: Optional[Sequence[Dict[str, Any]]] = None,
     first_break_prior: bool = False,
+    linear_time_window: Optional[Dict[str, Any]] = None,
 ):
     train_parser = build_split_parser(
         train_site_names,
@@ -1037,6 +1099,7 @@ def build_parsers(
         segm_class_count=segm_class_count,
         augmentations=augmentations,
         first_break_prior=first_break_prior,
+        linear_time_window=linear_time_window,
     )
     valid_parser = build_split_parser(
         valid_site_names,
@@ -1049,6 +1112,7 @@ def build_parsers(
         use_eval_split=True,
         segm_class_count=segm_class_count,
         first_break_prior=first_break_prior,
+        linear_time_window=linear_time_window,
     )
     logger.info(
         "Total train gathers: %d | Valid gathers: %d",
@@ -1102,6 +1166,14 @@ def build_loaders(
         **worker_kwargs,
     )
     return train_loader, valid_loader
+
+
+def _fmt_linear_time_window(cfg: Any) -> str:
+    if not isinstance(cfg, dict) or not cfg.get("enabled"):
+        return "off"
+    half = cfg.get("half_window_samples")
+    fallback = cfg.get("unlabeled_fallback", "skip")
+    return f"on (half={half} samples, fallback={fallback})"
 
 
 def _fmt_metric(value: Any) -> str:
@@ -1334,6 +1406,7 @@ class TrainingReport:
                 f"**Loss:** {meta.get('loss', '')}",
                 f"**LR step:** {meta.get('lr_step', '')}",
                 f"**Augmentations:** {', '.join(meta.get('augmentations') or []) or 'none'}",
+                f"**Linear time window:** {_fmt_linear_time_window(meta.get('linear_time_window'))}",
                 f"**Devices:** {meta.get('num_devices', meta.get('devices', ''))}",
                 f"**Strategy:** {meta.get('strategy', '')}",
                 f"**Backend:** {meta.get('backend', '')}",
@@ -1941,7 +2014,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "train_sites": list(train_site_names), "valid_sites": list(valid_site_names),
         "backend": args.backend, "eval_ratio": eval_ratio, "seed": args.seed,
         "batch_size": args.batch_size, "precision": args.precision,
-        "site_params": dict(COMMON_SITE_PARAMS), "augmentations": args.train_augmentations,
+        "site_params": {
+            **dict(COMMON_SITE_PARAMS),
+            "linear_time_window": copy.deepcopy(
+                getattr(args, "linear_time_window", None) or DEFAULT_LINEAR_TIME_WINDOW
+            ),
+        },
+        "augmentations": args.train_augmentations,
     }
     if resume_ckpt:
         validate_resume_checkpoint(load_checkpoint(resume_ckpt), model_config)
@@ -1992,6 +2071,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "augmentations": _aug_type_names(
                     getattr(args, "train_augmentations", None) or []
                 ),
+                "linear_time_window": copy.deepcopy(
+                    getattr(args, "linear_time_window", None) or DEFAULT_LINEAR_TIME_WINDOW
+                ),
                 "resume_ckpt": str(resume_ckpt) if resume_ckpt else None,
                 "init_ckpt": str(args.init_ckpt) if args.init_ckpt else None,
                 "preprocessing_version": PREPROCESSING_VERSION,
@@ -2037,6 +2119,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     augs = getattr(args, "train_augmentations", None) or []
     print("augmentations:", ", ".join(_aug_type_names(augs)) or "none")
+    print(
+        "linear_time_window:",
+        _fmt_linear_time_window(getattr(args, "linear_time_window", None)),
+    )
     if resume_ckpt is not None:
         print("Resume:", resume_ckpt)
     print("Train config:", getattr(args, "train_config_path", DEFAULT_TRAIN_CONFIG))
@@ -2054,6 +2140,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "source": str(getattr(args, "train_config_path", "")),
                 **dict(getattr(args, "train_recipe", None) or {}),
                 "augmentations": getattr(args, "train_augmentations", None) or [],
+                "linear_time_window": getattr(args, "linear_time_window", None)
+                or DEFAULT_LINEAR_TIME_WINDOW,
             },
             sort_keys=False,
             default_flow_style=False,
@@ -2103,6 +2191,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         segm_class_count=int(model_config.get("segm_class_count") or SEGMENTATION_CLASS_COUNT),
         augmentations=getattr(args, "train_augmentations", None),
         first_break_prior=bool(model_config.get("use_first_break_prior")),
+        linear_time_window=getattr(args, "linear_time_window", None),
     )
     train_loader, valid_loader = build_loaders(
         train_parser,

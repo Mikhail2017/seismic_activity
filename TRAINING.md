@@ -7,6 +7,34 @@ or `model: resnet34-before-after` (combinable with `-horizon`).
 `--encoder-weights imagenet` (etc.) initializes the backbone; default is
 train from scratch. `--model-config path.yaml` merges on top of the preset.
 
+## Recipe YAML: time window and augmentations
+
+`configs/train.yaml` (override with `--config`) owns loop knobs and preprocess.
+
+**Linear time window** (`linear_time_window`) is a train **and** validation
+preprocess, not an augmentation. It fits a two-slope first-arrival trend from
+labeled picks (min-offset, max-left, max-right), shifts each trace so the trend
+sits at `half_window_samples`, and crops to `2 * half_window_samples`. Unlabeled
+gathers use `unlabeled_fallback: skip` or constant-velocity LMO. Predictions are
+unshifted (`original_idx = warped_idx + sample_time_shift`) in `predict.py`.
+Prefix `crop` chops from t=0 and fights this window — omit `crop` when the
+window is enabled.
+
+**Train-only augs** (validation never uses this list):
+
+| `type` | Role |
+|---|---|
+| `crop` | Keep the start of the gather; drop late samples |
+| `kill` | Zero traces; `invalidate_labels: true` marks them don't-care |
+| `drop_and_pad` | Snap trace count; `drop_edges_next: false` keeps far offsets |
+| `flip` | Reverse the receiver axis (p=0.5) |
+| `rebalance_offsets` | Drop a fraction of near-offset traces (far traces kept) |
+| `polarity` | Multiply random traces by −1 |
+| `noise` / `resample_*` | Existing hardpicks ops |
+
+Suggested order with far-offset emphasis: `rebalance_offsets` → `kill`/`polarity`
+→ `drop_and_pad` (`drop_edges_next: false`) → `flip`.
+
 ## Validation and checkpoint consistency
 
 HDF5 training/evaluation uses the tracked local `OwnedMetadataGatherDataset`.
