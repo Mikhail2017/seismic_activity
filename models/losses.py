@@ -120,9 +120,13 @@ def get_loss_function(
             **loss_params,
         )
     elif loss_type == "crossentropy":
+        params = dict(loss_params)
+        weight = params.get("weight")
+        if weight is not None and not torch.is_tensor(weight):
+            params["weight"] = torch.tensor(weight, dtype=torch.float32)
         return torch.nn.CrossEntropyLoss(
             ignore_index=ignore_index,
-            **loss_params,
+            **params,
         )
     elif loss_type == "mse":
         assert ignore_index is None

@@ -15,6 +15,7 @@ import pandas as pd
 from .dataset import ShotGather
 
 HIT_BUFFERS_PX = (1, 3, 5, 7, 9)
+PAPER_TOLERANCES_PX = (0, 2, 5, 10)
 MIN_GALLERY_LABELED = 8
 
 
@@ -117,6 +118,47 @@ def headline_metrics(df: pd.DataFrame) -> Dict[str, Any]:
         out["GatherCoverage"] = float(df["GatherCoverage"].mean())
     else:
         out["GatherCoverage"] = None
+    out.update(paper_pick_metrics(df))
+    return out
+
+
+def paper_pick_metrics(df: pd.DataFrame) -> Dict[str, Any]:
+    """Coverage / W_pred / W_total / MAE for the Meneses evaluation protocol.
+
+    Traces with a finite ``Errors`` value are treated as labelled. A prediction
+    counts only when ``Predictions > 0``. Missing predictions are misses in
+    ``W_total`` and are excluded from ``W_pred`` and MAE.
+    """
+    if df.empty or "Errors" not in df.columns:
+        return {
+            "Coverage": None,
+            "MAE": None,
+            **{f"W_pred_{x}": None for x in PAPER_TOLERANCES_PX},
+            **{f"W_total_{x}": None for x in PAPER_TOLERANCES_PX},
+        }
+    labeled = df["Errors"].notna()
+    pred = pd.to_numeric(df.get("Predictions"), errors="coerce") if "Predictions" in df.columns else pd.Series(np.nan, index=df.index)
+    pred_ok = labeled & pred.notna() & (pred > 0)
+    n_labeled = int(labeled.sum())
+    n_pred = int(pred_ok.sum())
+    abs_err = df["AbsError"] if "AbsError" in df.columns else df["Errors"].abs()
+    out: Dict[str, Any] = {
+        "Coverage": float(n_pred / n_labeled) if n_labeled else None,
+        "MAE": float(abs_err.loc[pred_ok].mean()) if n_pred else None,
+        "n_pred": n_pred,
+        "n_labeled": n_labeled,
+    }
+    hit_pred = abs_err.loc[pred_ok]
+    for x in PAPER_TOLERANCES_PX:
+        if n_pred:
+            out[f"W_pred_{x}"] = float((hit_pred <= x).mean())
+        else:
+            out[f"W_pred_{x}"] = None
+        if n_labeled:
+            ok = pred_ok & (abs_err <= x)
+            out[f"W_total_{x}"] = float(ok.sum() / n_labeled)
+        else:
+            out[f"W_total_{x}"] = None
     return out
 
 
@@ -489,6 +531,16 @@ def write_index_html(path: Path, *, title: str, metrics: Dict[str, Any], links: 
             "P90AbsoluteError",
             "MeanBiasError",
             "GatherCoverage",
+            "Coverage",
+            "W_pred_0",
+            "W_pred_2",
+            "W_pred_5",
+            "W_pred_10",
+            "W_total_0",
+            "W_total_2",
+            "W_total_5",
+            "W_total_10",
+            "MAE",
             "loss",
         }
     )
@@ -552,6 +604,16 @@ def write_report_md(
         "MeanAbsoluteErrorMs",
         "MeanBiasErrorMs",
         "GatherCoverage",
+        "Coverage",
+        "W_pred_0",
+        "W_pred_2",
+        "W_pred_5",
+        "W_pred_10",
+        "W_total_0",
+        "W_total_2",
+        "W_total_5",
+        "W_total_10",
+        "MAE",
         "loss",
     ):
         if key in metrics:

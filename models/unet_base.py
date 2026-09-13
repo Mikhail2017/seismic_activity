@@ -37,6 +37,15 @@ SUPPORTED_DECODER_TYPES = [
 ]
 
 
+def _make_activation(name: typing.Optional[typing.AnyStr] = None) -> torch.nn.Module:
+    key = str(name or "relu").strip().lower().replace("_", "").replace("-", "")
+    if key in {"relu"}:
+        return torch.nn.ReLU(inplace=True)
+    if key in {"leakyrelu"}:
+        return torch.nn.LeakyReLU(negative_slope=0.01, inplace=True)
+    raise ValueError(f"unsupported activation {name!r}; expected relu or leakyrelu")
+
+
 class Basic2DBlock(torch.nn.Module):
     """Base class for the 2D blocks.
 
@@ -61,6 +70,7 @@ class Basic2DBlock(torch.nn.Module):
         stride: int = 1,
         padding: int = 1,
         coordconv: bool = False,
+        activation: typing.Optional[typing.AnyStr] = None,
     ):
         """Constructs the double-layer block."""
         super().__init__()
@@ -82,7 +92,7 @@ class Basic2DBlock(torch.nn.Module):
                 coordconv=coordconv,
             ),
             torch.nn.BatchNorm2d(out_channels),
-            torch.nn.ReLU(inplace=True),
+            _make_activation(activation),
         )
         self.layer2 = torch.nn.Sequential(
             coordconv_utils.make_conv2d(
@@ -95,7 +105,7 @@ class Basic2DBlock(torch.nn.Module):
                 coordconv=coordconv,
             ),
             torch.nn.BatchNorm2d(out_channels),
-            torch.nn.ReLU(inplace=True),
+            _make_activation(activation),
         )
 
     @abc.abstractmethod
@@ -128,6 +138,7 @@ class Basic2DDecoderBlock(Basic2DBlock):
         padding: int = 1,
         coordconv: bool = False,
         attention: typing.Optional[typing.AnyStr] = None,
+        activation: typing.Optional[typing.AnyStr] = None,
     ):
         """Constructs a decoder block on top of a standard double-layer block."""
         concat_channels = skip_channels + upsampl_channels
@@ -138,6 +149,7 @@ class Basic2DDecoderBlock(Basic2DBlock):
             stride=stride,
             padding=padding,
             coordconv=coordconv,
+            activation=activation,
         )
         # note: we keep these args as attributes for debugging/easy access from other modules
         self.prev_channels = prev_channels
@@ -183,6 +195,7 @@ class Basic2DEncoder(torch.nn.Module):
         in_channels: int = 3,
         block_out_channels: typing.Sequence[int] = tuple([16, 32, 64, 128, 256]),  # = vanilla unet
         coordconv: bool = False,
+        activation: typing.Optional[typing.AnyStr] = None,
     ):
         """Constructs a series of double-layer blocks with increasing feature depth."""
         super().__init__()
@@ -198,6 +211,7 @@ class Basic2DEncoder(torch.nn.Module):
                 in_channels=out_channels[-1],
                 out_channels=block_out_ch,
                 coordconv=coordconv,
+                activation=activation,
             ))
             out_channels.append(block_out_ch)
         # note: we also return the downsampled map at the end with the same ch count as the last block
@@ -234,6 +248,7 @@ class Basic2DDecoder(torch.nn.Module):
         attention: typing.Optional[typing.AnyStr] = None,
         use_checkpointing: bool = False,
         use_skip_connections: bool = True,  # useful for debugging & for usage in auto encoders...
+        activation: typing.Optional[typing.AnyStr] = None,
         # TODO: forward some conv2d-level args from here?
     ):
         """Constructs a series of decoder blocks with decreasing feature depth."""
@@ -245,6 +260,7 @@ class Basic2DDecoder(torch.nn.Module):
             self.mid_block = Basic2DEncoderBlock(
                 in_channels=in_channels[-1],
                 out_channels=mid_block_channels,
+                activation=activation,
             )
             if use_checkpointing:
                 assert fairscale is not None, "could not import fairscale library!"
@@ -284,6 +300,7 @@ class Basic2DDecoder(torch.nn.Module):
                 out_channels=block_out_ch,
                 coordconv=coordconv,
                 attention=attention,
+                activation=activation,
             )
             if use_checkpointing:
                 assert fairscale is not None, "could not import fairscale library!"
@@ -398,6 +415,8 @@ class UNet(model_base.BaseSegmModel):
             assert encoder_block_count > 0, f"invalid encoder block count! ({encoder_block_count})"
             if "encoder_block_channels" in hyper_params:
                 encoder_block_channels = hyper_params["encoder_block_channels"]
+                if isinstance(encoder_block_channels, tuple):
+                    encoder_block_channels = list(encoder_block_channels)
                 assert isinstance(encoder_block_channels, list), "unexpected type for channel list"
             else:
                 encoder_block_channels = [None] * encoder_block_count  # will be auto-deduced
@@ -472,6 +491,7 @@ class UNet(model_base.BaseSegmModel):
         decoder_attention_type = hyper_params["decoder_attention_type"]
         use_skip_connections = hyper_params["use_skip_connections"]
         use_checkpointing = hyper_params["use_checkpointing"]
+        activation = hyper_params.get("activation", "relu")
 
         if encoder_type == "vanilla":
             # build a classic (simple) CNN based only on stacks of Conv2d-BN-ReLU layers
@@ -484,6 +504,7 @@ class UNet(model_base.BaseSegmModel):
                 in_channels=encoder_input_channels,
                 block_out_channels=encoder_block_channels,
                 coordconv=coordconv,
+                activation=activation,
             )
             assert encoder.block_count == encoder_block_count
         elif encoder_type in ["CustomResNet", "custom-resnet", "resnet"]:
@@ -576,6 +597,7 @@ class UNet(model_base.BaseSegmModel):
                 attention=decoder_attention_type,
                 use_checkpointing=use_checkpointing,
                 use_skip_connections=use_skip_connections,
+                activation=activation,
             )
         else:
             raise NotImplementedError  # TODO: add more decoders here!

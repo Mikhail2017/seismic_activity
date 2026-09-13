@@ -72,6 +72,7 @@ from seismic_utils.pickers import (
     PICKER_BEFORE_AFTER,
     PICKER_FBPUNET,
     attach_smooth_evaluators,
+    attach_unpicked_evaluators,
     parse_model_suffixes,
     picker_from_hparams,
     spec_for,
@@ -159,6 +160,16 @@ MODEL_PRESETS: Dict[str, Dict[str, Any]] = {
         "mid_block_channels": 256,
         "decoder_block_channels": "[256, 128, 64, 32, 16]",
         "lr": 0.001,
+    },
+    "meneses": {
+        "unet_encoder_type": "vanilla",
+        "encoder_block_count": 4,
+        "encoder_block_channels": [64, 128, 256, 512],
+        "mid_block_channels": 512,
+        "decoder_block_channels": "[512, 256, 128, 64]",
+        "lr": 0.001,
+        "use_dist_offsets": False,
+        "activation": "leakyrelu",
     },
 }
 
@@ -847,6 +858,21 @@ def build_model_config(
         sched["step_size"] = int(lr_step)
         base["scheduler_params"] = sched
 
+    if recipe.get("use_dist_offsets") is not None:
+        base["use_dist_offsets"] = bool(recipe["use_dist_offsets"])
+    if recipe.get("activation"):
+        base["activation"] = recipe["activation"]
+    if recipe.get("scheduler_type"):
+        base["scheduler_type"] = str(recipe["scheduler_type"])
+        if recipe.get("scheduler_params"):
+            base["scheduler_params"] = dict(recipe["scheduler_params"])
+    if recipe.get("loss_params"):
+        merged = dict(base.get("loss_params") or {})
+        merged.update(recipe["loss_params"])
+        base["loss_params"] = merged
+    if recipe.get("minimal_annotations"):
+        base["minimal_annotations"] = dict(recipe["minimal_annotations"])
+
     picker_spec = spec_for(resolved_picker)
     base["picker"] = picker_spec.name
     base["segm_class_count"] = int(picker_spec.segm_class_count or 1)
@@ -865,13 +891,25 @@ def build_model_config(
             f"Only model_type=FBPUNet is supported "
             f"(got {base['model_type']!r}). Use --model / unet_encoder_type for architectures."
         )
+    ebc = base.get("encoder_block_channels")
+    if isinstance(ebc, str):
+        import ast
+
+        parsed = ast.literal_eval(ebc)
+        base["encoder_block_channels"] = list(parsed)
+    elif isinstance(ebc, tuple):
+        base["encoder_block_channels"] = list(ebc)
     return base, model_label
 
 
 def list_models() -> None:
     print("Available --model presets (all train local models.fbp.unet.FBPUNet):\n")
     for name, cfg in sorted(MODEL_PRESETS.items()):
-        extra = "  +horizon-prior" if cfg.get("use_first_break_prior") else ""
+        extra = ""
+        if cfg.get("use_first_break_prior"):
+            extra += "  +horizon-prior"
+        if str(cfg.get("activation") or "").lower() == "leakyrelu":
+            extra += "  +leakyrelu"
         print(
             f"  {name:18s}  encoder={cfg['unet_encoder_type']}"
             f"  decoder={cfg['decoder_block_channels']}  lr={cfg['lr']}{extra}"
@@ -911,6 +949,7 @@ def _site_params(
     use_eval_split: bool,
     augmentations: Optional[Sequence[Dict[str, Any]]] = None,
     first_break_prior: bool = False,
+    extra_site_params: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     params: Dict[str, Any] = dict(COMMON_SITE_PARAMS)
     if first_break_prior:
@@ -928,6 +967,8 @@ def _site_params(
             params["augmentations"] = copy.deepcopy(ops)
     if eval_ratio is not None:
         params["subset"] = {"eval_ratio": eval_ratio, "use_eval_split": use_eval_split}
+    if extra_site_params:
+        params.update(extra_site_params)
     return params
 
 
@@ -944,6 +985,7 @@ def build_split_parser(
     segm_class_count: int = SEGMENTATION_CLASS_COUNT,
     augmentations: Optional[Sequence[Dict[str, Any]]] = None,
     first_break_prior: bool = False,
+    extra_site_params: Optional[Dict[str, Any]] = None,
 ):
     """Build a concatenated parser for one split (train or valid)."""
     import hardpicks
@@ -966,6 +1008,7 @@ def build_split_parser(
                         use_eval_split=use_eval_split,
                         augmentations=augmentations,
                         first_break_prior=first_break_prior,
+                        extra_site_params=extra_site_params,
                     ),
                     segm_class_count=segm_class_count,
                 )
@@ -1004,6 +1047,7 @@ def build_split_parser(
                             use_eval_split=use_eval_split,
                             augmentations=augmentations,
                             first_break_prior=first_break_prior,
+                            extra_site_params=extra_site_params,
                         ),
                     },
                     prefix=prefix,
@@ -1929,6 +1973,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         except FileNotFoundError as exc:
             raise SystemExit(str(exc)) from exc
 
+    recipe = getattr(args, "train_recipe", None) or {}
+    if recipe.get("minimal_annotations"):
+        raise SystemExit(
+            "The minimal-annotations recipe is site-specific and incompatible with "
+            "--fold / the default trainer. Use train/fbp_self_train.py "
+            "(see TRAINING.md)."
+        )
+
     model_config, model_label = build_model_config(
         model=args.model,
         max_epochs=args.epochs,
@@ -2137,6 +2189,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         model.load_state_dict(init_checkpoint["state_dict"], strict=True)
     if str(model_config.get("picker") or "") == PICKER_BEFORE_AFTER:
         attach_smooth_evaluators(model, model_config)
+    if model_config.get("minimal_annotations"):
+        attach_unpicked_evaluators(model, model_config)
     setattr(model, "_tbx_logger", tbx_logger)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"FBPUNet[{model_label}] ready: {n_params / 1e6:.2f}M trainable parameters")

@@ -1,5 +1,5 @@
 `--model` presets: `resnet18` (default), `resnet34`, `resnet34-horizon`,
-`resnet50`, `efficientnet-b0`, `efficientnet-b4`, `vanilla`, or any SMP encoder
+`resnet50`, `efficientnet-b0`, `efficientnet-b4`, `vanilla`, `meneses`, or any SMP encoder
 name. `resnet34-horizon` is ResNet34 plus the linear-moveout first-break prior
 channel (5th input). A `*-horizon` suffix on any preset/SMP encoder does the
 same. Before/after masks: `--picker before_after`, YAML `picker: before_after`,
@@ -124,30 +124,6 @@ The recipe on the training machine matters: `--picker before_after --fold A`
 alone does not select ResNet34, HDF5, four epochs, or batch size 32. Specify those
 flags or preserve the resolved recipe/model config when reproducing a run.
 
-## Geometry-conditioned U-Net (GeoNorm)
-
-`geonorm.md` maps per-trace offset/elevation into the existing FBPUNet. Opt-in
-via recipe `geonorm:` or `--geonorm A|B|C|D` (default **A**, unchanged baseline).
-
-| Ablation | Offset/elev input channels | GeoNorm |
-| --- | --- | --- |
-| A | no | no |
-| B | yes | no |
-| C | no | yes (every 2D norm → GroupNorm + per-trace scale/shift) |
-| D | yes | yes |
-
-`δx`/`δz` are min-max normalized on **training gathers only** and written next
-to the checkpoint (`geom_stats.yaml`). Flip/drop/pad keep `geom_features`
-aligned with traces. Eval restores the same stats:
-
-```bash
-python train/fbp_train.py --fold A --picker before_after --geonorm D
-python train/fbp_eval.py --ckpt-dir output/train_foldA_resnet18-before-after-geomD_... --fold A
-```
-
-GeoNorm modulates the **trace** axis of `(B, C, traces, time)` — not time.
-Existing `use_dist_offsets` channels stay independent of ablation B's two maps.
-
 ## Lateral pick cleaner (eval only, no retrain)
 
 After decode, isolated pick crashes (line-end dives, single-trace jumps) are
@@ -159,7 +135,7 @@ Same checkpoint as a normal eval, plus `--lateral-clean`:
 
 ```bash
 python train/fbp_eval.py --picker before_after \
-  --ckpt output/train_foldA_resnet18-before-after-geomd_.../best-epoch=019-step=043500.ckpt \
+  --ckpt output/train_foldA_resnet18-before-after_.../best-epoch=019-step=043500.ckpt \
   --fold A --backend hdf5 --data-dir /tmp/data \
   --lateral-clean
 ```
@@ -180,6 +156,38 @@ early picks on a whole gather (`01` / `02` style) stay unchanged.
 
 This is not a substitute for `--smooth-threshold` (that only changes the
 before/after decoder). Use the cleaner for along-line outliers after decode.
+
+## Minimal annotations (Meneses self-training)
+
+Site-specific replica of Meneses et al. 2026: train on ~1% labelled gathers
+(paper counts 148 / 54 / 120 / 43, then 75/25 train/val), score the remaining
+99% against **manual** picks. This path is **not** compatible with `--fold`,
+`before_after`, `-horizon`, or GeoNorm.
+
+```bash
+python train/fbp_self_train.py --config configs/minimal_annotations.yaml \
+    --sites Halfmile --ablation combined --seed 0
+python train/fbp_self_train.py --smoke
+```
+
+`--smoke` is Halfmile, 8 labelled gathers, 1 epoch, 2 outer steps (one QC draw).
+
+`--ablation` is `control` | `windowed` | `weighted` | `combined` | `iterative`.
+Static ablations run 25 epochs. `iterative` is 15 × 5 epochs with offset-bin
+2σ QC (20 bins, keep gathers with ≥85% surviving picks), 200 unlabeled gathers
+per step, and weight resets after iterations 5 and 10.
+
+Recipe defaults: `--model meneses` (4-scale 64→512 U-Net, BN + LeakyReLU 0.01,
+scratch), FB-window vs background (`picker: fbpunet`), WBCE weight 100, no
+augmentation, per-trace z-score then int16 quantize, batch pad to a multiple of
+16 with amplitude 1. Window width is ±10 ms (5 samples at 2 ms, 10 at Lalor 1 ms).
+Picks are the per-trace argmax of the FB logit; a trace is unpicked if background
+wins everywhere.
+
+Headline metrics on the 99% pool: coverage, \(W_{pred}(x)\) / \(W_{total}(x)\)
+for \(x \in \{0,2,5,10\}\), MAE on predicted traces. \(W_{total}(10)\) is the
+paper’s end-to-end number. Splits are written to `split.json` (reuse with
+`--split-json`).
 
 ## Regression validation
 

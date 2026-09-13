@@ -158,11 +158,35 @@ def smooth_threshold_from_hparams(hp: Mapping[str, Any] | None) -> int:
         return DEFAULT_SMOOTH_THRESHOLD
 
 
+def decode_argmax_fb_unpicked(raw_preds):
+    """Per-trace argmax of the FB logit; unpicked (index 0) if background wins everywhere.
+
+    ``raw_preds`` is ``(B, 2, n_traces, n_samples)`` with channel 0 = background
+    and channel 1 = first break.
+    """
+    import torch
+
+    if raw_preds.ndim != 4 or raw_preds.shape[1] < 2:
+        raise ValueError(f"expected (B, 2, traces, time) logits, got {tuple(raw_preds.shape)}")
+    z_bg = raw_preds[:, 0]
+    z_fb = raw_preds[:, 1]
+    picks = torch.argmax(z_fb, dim=-1)
+    fb_wins = z_fb > z_bg
+    unpicked = ~fb_wins.any(dim=-1)
+    picks = picks.masked_fill(unpicked, 0)
+    gathered = torch.gather(z_fb, -1, picks.unsqueeze(-1)).squeeze(-1)
+    probs = torch.sigmoid(gathered)
+    probs = probs.masked_fill(unpicked, float("nan"))
+    return picks, probs
+
+
 def decode_nn_picks(raw_preds, model, *, picker: str | None = None, smooth_threshold: int | None = None):
     """Logits → ``(pick_indices, probabilities)`` for a neural picker."""
+    hp = dict(getattr(model, "hparams", {}) or {})
+    if hp.get("minimal_annotations"):
+        return decode_argmax_fb_unpicked(raw_preds)
     resolved = normalize_picker(picker or picker_from_model(model))
     if resolved == PICKER_BEFORE_AFTER:
-        hp = dict(getattr(model, "hparams", {}) or {})
         thr = int(smooth_threshold) if smooth_threshold is not None else smooth_threshold_from_hparams(hp)
         return fb_smooth_from_logits(raw_preds, threshold=thr)
 
@@ -304,9 +328,50 @@ def attach_smooth_evaluators(model, hyper_params: Mapping[str, Any]) -> None:
         model.train_evaluator = cls(hp)
 
 
+def attach_unpicked_evaluators(model, hyper_params: Mapping[str, Any]) -> None:
+    """Use argmax-FB / background-wins-unpicked decode for valid/test metrics."""
+    from hardpicks.metrics.base import NoneEvaluator
+
+    hp = dict(hyper_params)
+    keep_train_none = isinstance(model.train_evaluator, NoneEvaluator)
+    cls = _unpicked_evaluator_class()
+    model.valid_evaluator = cls(hp)
+    model.test_evaluator = cls(hp)
+    model.pred_evaluator = cls(hp)
+    if not keep_train_none:
+        model.train_evaluator = cls(hp)
+
+
+def _unpicked_evaluator_class():
+    cached = getattr(_unpicked_evaluator_class, "_cached", None)
+    if cached is not None:
+        return cached
+
+    import hardpicks.metrics.fbp.utils as utils
+    from hardpicks.metrics.fbp.evaluator import FBPEvaluator
+
+    class _ArgmaxUnpickedFBPEvaluator(FBPEvaluator):
+        def ingest(self, batch, batch_idx, raw_preds):
+            orig = utils.get_regr_preds_from_raw_preds
+
+            def _decode(raw_preds, segm_class_count, prob_threshold=0.5):
+                return decode_argmax_fb_unpicked(raw_preds)
+
+            utils.get_regr_preds_from_raw_preds = _decode
+            try:
+                return super().ingest(batch, batch_idx, raw_preds)
+            finally:
+                utils.get_regr_preds_from_raw_preds = orig
+
+    _unpicked_evaluator_class._cached = _ArgmaxUnpickedFBPEvaluator  # type: ignore[attr-defined]
+    return _ArgmaxUnpickedFBPEvaluator
+
+
 def make_eval_evaluator(hyper_params: Mapping[str, Any], picker: str):
     """Evaluator used by ``fbp_eval.py`` for a neural picker."""
     hp = dict(hyper_params)
+    if hp.get("minimal_annotations"):
+        return _unpicked_evaluator_class()(hp)
     if normalize_picker(picker) == PICKER_BEFORE_AFTER:
         return _smooth_evaluator_class()(hp)
     from hardpicks.metrics.fbp.evaluator import FBPEvaluator

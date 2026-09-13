@@ -10,6 +10,7 @@ import numpy as np
 
 from .dataset import ShotGather
 from .hardpicks_pl_compat import ensure_hardpicks_lightning_compat
+from .minimal_preprocess import uses_minimal_preprocess
 
 _BAD_FB_LABEL = -1
 _DEAD_TRACE_EPS = 1e-8
@@ -136,11 +137,18 @@ def shot_gather_to_inference_dict(
     }
 
 
-def _prepare_gather_for_inference(gather: dict[str, Any]) -> dict[str, Any]:
+def _prepare_gather_for_inference(gather: dict[str, Any], model=None) -> dict[str, Any]:
     """Normalize samples/offsets like training defaults (no full deepcopy)."""
+    hp = dict(getattr(model, "hparams", {}) or {}) if model is not None else {}
+    out = dict(gather)
+    if uses_minimal_preprocess(hp):
+        from .minimal_preprocess import apply_amplitude_preprocess
+
+        out["samples"] = apply_amplitude_preprocess(np.asarray(out["samples"], dtype=np.float32))
+        return out
+
     from hardpicks.data.fbp.gather_preprocess import ShotLineGatherPreprocessor
 
-    out = dict(gather)
     out["samples"] = ShotLineGatherPreprocessor.normalize_sample_with_tracewise_abs_max_strategy(
         np.asarray(out["samples"], dtype=np.float32)
     )
@@ -177,12 +185,18 @@ def predict_first_breaks_ms(
 
     from .pickers import picker_from_model
 
-    prepared = _prepare_gather_for_inference(hardpicks_gather)
+    prepared = _prepare_gather_for_inference(hardpicks_gather, model=model)
     n_traces = int(prepared["trace_count"])
     dt_ms = float(prepared["sample_rate_ms"])
     resolved_picker = picker or picker_from_model(model)
 
-    batch = fbp_data_module.fbp_batch_collate([prepared], pad_to_nearest_pow2=True)
+    hp = dict(getattr(model, "hparams", {}) or {})
+    if uses_minimal_preprocess(hp):
+        from .minimal_preprocess import minimal_batch_collate
+
+        batch = minimal_batch_collate([prepared])
+    else:
+        batch = fbp_data_module.fbp_batch_collate([prepared], pad_to_nearest_pow2=True)
     with torch.no_grad():
         input_tensor = model_utils.prepare_input_features(
             batch,

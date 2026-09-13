@@ -17,8 +17,6 @@ Example::
         --fold A --backend npz
     python train/fbp_eval.py --picker before_after --ckpt-dir output/train_foldA_resnet34-before-after \\
         --fold A --backend hdf5 --rmse-above 7
-    python train/fbp_eval.py --ckpt-dir output/train_foldA_resnet18-before-after-geomD_... \\
-        --fold A --backend hdf5   # GeoNorm stats restored from the checkpoint
     python train/fbp_eval.py --picker before_after --ckpt ... --fold A --backend hdf5 \\
         --data-dir /tmp/data --lateral-clean
 """
@@ -757,6 +755,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "MeanAbsoluteError",
         "MeanAbsoluteErrorMs",
         "GatherCoverage",
+        "Coverage",
+        "W_pred_0",
+        "W_pred_2",
+        "W_pred_5",
+        "W_pred_10",
+        "W_total_0",
+        "W_total_2",
+        "W_total_5",
+        "W_total_10",
+        "MAE",
         "loss",
     ):
         print(f"  {key:24s} {metrics.get(key)}")

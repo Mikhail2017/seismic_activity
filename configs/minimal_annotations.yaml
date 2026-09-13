@@ -1,0 +1,41 @@
+# Meneses et al. 2026 replica recipe for train/fbp_self_train.py
+# Site-specific 1% labels. Do not use with --fold / before_after / GeoNorm.
+#
+#   python train/fbp_self_train.py --config configs/minimal_annotations.yaml \
+#       --sites Halfmile --ablation combined --seed 0
+#   python train/fbp_self_train.py --smoke
+
+seed: 0
+backend: hdf5
+sites: Halfmile
+
+epochs: 25                 # static ablations; iterative uses 5 per outer step
+batch_size: 8
+patience: 0
+save_top_k: 1
+precision: "32"
+num_workers: 0
+log_every_n_steps: 10
+print_every_n_steps: 50
+
+model: meneses
+picker: fbpunet
+encoder_weights: null
+loss: crossentropy
+loss_params:
+  weight: [1, 100]
+lr: 0.001
+scheduler_type: ConstantLR
+scheduler_params:
+  factor: 1.0
+  total_iters: 1000000000
+use_dist_offsets: false
+activation: leakyrelu
+augmentations: []
+
+minimal_annotations:
+  preprocess: trace_zscore_int16_pad1
+  pad_multiple: 16
+  pad_value: 1
+  label_window_ms: 10
+  fb_weight: 100
