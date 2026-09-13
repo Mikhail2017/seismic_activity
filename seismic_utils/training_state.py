@@ -9,7 +9,7 @@ from pathlib import Path
 
 import torch
 
-from seismic_utils.pickers import picker_from_hparams
+from seismic_utils.pickers import before_after_decoder_from_hparams, picker_from_hparams
 
 
 PREPROCESSING_VERSION = "owned-hdf5-metadata-v1"
@@ -39,6 +39,9 @@ def validate_resume_checkpoint(checkpoint, config):
             return ast.literal_eval(value)
         return value
     mismatches = [key for key in keys if normalized(saved.get(key)) != normalized(config.get(key))]
+    # Absence in an older checkpoint is semantically identical to explicit legacy.
+    if before_after_decoder_from_hparams(saved) != before_after_decoder_from_hparams(config):
+        mismatches.append("before_after_decoder")
     if mismatches:
         raise ValueError("Incompatible resume settings: " + ", ".join(mismatches))
     if "seismic_scheduler_state" not in checkpoint:

@@ -62,7 +62,7 @@ from seismic_utils.fbp_eval_report import (
     write_trace_table,
     write_worst_html,
 )
-from seismic_utils.fb_smooth import DEFAULT_SMOOTH_THRESHOLD
+from seismic_utils.fb_smooth import BEFORE_AFTER_DECODERS, DEFAULT_SMOOTH_THRESHOLD
 from seismic_utils.pick_clean import (
     DEFAULT_LATERAL_MAX_DEV,
     DEFAULT_LATERAL_MAX_FLAG_FRAC,
@@ -75,6 +75,7 @@ from seismic_utils.hardpicks_pl_compat import ensure_hardpicks_lightning_compat
 from seismic_utils.pickers import (
     PICKER_BEFORE_AFTER,
     PICKER_FBPUNET,
+    before_after_decoder_from_hparams,
     make_eval_evaluator,
     picker_from_hparams,
     reconcile_cli_picker,
@@ -167,11 +168,15 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     p.add_argument("--report-dir", type=Path, default=None, help="Report root (default: <repo>/report).")
     p.add_argument(
+        "--before-after-decoder", choices=BEFORE_AFTER_DECODERS, default=None,
+        help="Override before/after decoding without changing weights (default: checkpoint, or legacy).",
+    )
+    p.add_argument(
         "--smooth-threshold",
         type=int,
         default=None,
         help=(
-            "Before/after pick smoother window in samples "
+            "Legacy before/after pick smoother window in samples (unused by change_point) "
             f"(default: checkpoint hparams or {DEFAULT_SMOOTH_THRESHOLD})."
         ),
     )
@@ -558,6 +563,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             args.picker,
         )
     picker_spec = spec_for(resolved_picker)
+    if args.before_after_decoder is not None:
+        if resolved_picker != PICKER_BEFORE_AFTER:
+            raise SystemExit("--before-after-decoder requires a before_after checkpoint")
+        hp["before_after_decoder"] = args.before_after_decoder
+    if resolved_picker == PICKER_BEFORE_AFTER:
+        hp["before_after_decoder"] = before_after_decoder_from_hparams(hp)
+        if args.smooth_threshold is not None and hp["before_after_decoder"] == "change_point":
+            logger.warning("--smooth-threshold is unused by the change_point decoder")
     if args.smooth_threshold is not None:
         hp["segm_first_break_smooth_threshold"] = int(args.smooth_threshold)
     hp["segm_class_count"] = picker_spec.segm_class_count or getattr(model, "segm_class_count", 1)
@@ -567,6 +580,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         getattr(model, "segm_first_break_prob_threshold", 0.0),
     )
     evaluator = make_eval_evaluator(hp, resolved_picker)
+    if resolved_picker == PICKER_BEFORE_AFTER:
+        print(f"Before/after decoder: {hp['before_after_decoder']}")
 
     parser = train_cli.build_split_parser(
         site_names,
@@ -653,7 +668,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     metrics["loss"] = mean_loss
     metrics["picker"] = resolved_picker
     if resolved_picker == PICKER_BEFORE_AFTER:
-        metrics["smooth_threshold"] = hp.get("segm_first_break_smooth_threshold")
+        metrics["before_after_decoder"] = hp["before_after_decoder"]
+        metrics["smooth_threshold"] = (
+            evaluator.smooth_threshold if hp["before_after_decoder"] == "legacy" else None
+        )
     if args.lateral_clean:
         metrics["lateral_clean"] = {
             "enabled": True,
@@ -770,6 +788,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "fold": site_label if args.fold else None,
         "backend": args.backend,
         "smooth_threshold": metrics.get("smooth_threshold"),
+        "before_after_decoder": metrics.get("before_after_decoder"),
         "rmse_above": args.rmse_above,
         "lateral_clean": metrics.get("lateral_clean"),
     }

@@ -5,7 +5,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Mapping
 
-from .fb_smooth import DEFAULT_SMOOTH_THRESHOLD, fb_smooth_from_logits
+from .fb_smooth import (
+    DEFAULT_SMOOTH_THRESHOLD, decode_before_after_logits, normalize_before_after_decoder,
+)
 
 PICKER_FBPUNET = "fbpunet"
 PICKER_BEFORE_AFTER = "before_after"
@@ -158,13 +160,24 @@ def smooth_threshold_from_hparams(hp: Mapping[str, Any] | None) -> int:
         return DEFAULT_SMOOTH_THRESHOLD
 
 
-def decode_nn_picks(raw_preds, model, *, picker: str | None = None, smooth_threshold: int | None = None):
+def before_after_decoder_from_hparams(hp: Mapping[str, Any] | None) -> str:
+    return normalize_before_after_decoder((hp or {}).get("before_after_decoder"))
+
+
+def decode_nn_picks(
+    raw_preds, model, *, picker: str | None = None, smooth_threshold: int | None = None,
+    before_after_decoder: str | None = None, sample_counts=None,
+):
     """Logits → ``(pick_indices, probabilities)`` for a neural picker."""
     resolved = normalize_picker(picker or picker_from_model(model))
     if resolved == PICKER_BEFORE_AFTER:
         hp = dict(getattr(model, "hparams", {}) or {})
         thr = int(smooth_threshold) if smooth_threshold is not None else smooth_threshold_from_hparams(hp)
-        return fb_smooth_from_logits(raw_preds, threshold=thr)
+        decoder = before_after_decoder if before_after_decoder is not None else before_after_decoder_from_hparams(hp)
+        return decode_before_after_logits(raw_preds, decoder=decoder, threshold=thr, sample_counts=sample_counts)
+
+    if before_after_decoder is not None:
+        raise ValueError("before_after_decoder requires picker=before_after")
 
     import hardpicks.metrics.fbp.utils as metrics_utils
 
@@ -179,7 +192,7 @@ def decode_nn_picks(raw_preds, model, *, picker: str | None = None, smooth_thres
 
 
 class SmoothFBPEvaluator:
-    """``FBPEvaluator`` whose decode uses :func:`fb_smooth_from_logits`.
+    """``FBPEvaluator`` using the configured before/after decoder.
 
     Instantiated lazily so importing this module does not require hardpicks.
     """
@@ -208,6 +221,7 @@ def _smooth_evaluator_class():
         def __init__(self, hyper_params):
             super().__init__(hyper_params)
             self.smooth_threshold = smooth_threshold_from_hparams(hyper_params)
+            self.before_after_decoder = before_after_decoder_from_hparams(hyper_params)
 
         def ingest(self, batch, batch_idx, raw_preds):
             if not self.metrics_metamap:
@@ -215,8 +229,9 @@ def _smooth_evaluator_class():
             assert batch_idx not in self.seen_batch_idxs, "we've seen this minibatch already!"
             assert len(batch["rec_ids"]) == len(batch["offset_distances"])
 
-            regr_preds, probabilities_of_fbp = fb_smooth_from_logits(
-                raw_preds, threshold=self.smooth_threshold, sample_counts=batch.get("sample_count")
+            regr_preds, probabilities_of_fbp = decode_before_after_logits(
+                raw_preds, decoder=self.before_after_decoder,
+                threshold=self.smooth_threshold, sample_counts=batch.get("sample_count")
             )
             if self.extract_fbp_probability:
                 assert probabilities_of_fbp is not None, "probabilities_of_fbp is None"
@@ -291,7 +306,7 @@ def _smooth_evaluator_class():
 
 
 def attach_smooth_evaluators(model, hyper_params: Mapping[str, Any]) -> None:
-    """Replace Lightning evaluators so valid/HitRate uses ``fb_smooth_result``."""
+    """Restore the configured before/after decoder for all Lightning evaluators."""
     from hardpicks.metrics.base import NoneEvaluator
 
     hp = dict(hyper_params)

@@ -92,6 +92,60 @@ is retained for checkpoint compatibility; it does **not** guarantee a contiguous
 run of `smooth_threshold` samples. Changing that selection rule is a separate
 model/decoder experiment, not a validation consistency fix.
 
+## Opt-in single-transition before/after decoder (no retraining required)
+
+`--before-after-decoder legacy|change_point` selects how two-class logits become
+picks; `--picker before_after` still selects the training task. The default for
+old checkpoints with no decoder metadata is **legacy**, unchanged.
+
+`change_point` scores all boundaries using the before probability before the
+boundary and the after probability from the boundary onward. It uses float32
+log probabilities and cumulative sums, excludes time padding, and does not use
+labels. An interior boundary must strictly beat both all-before and all-after
+explanations. Otherwise the result is `0` (no pick), with a NaN probability.
+Tied interior minima select the earliest boundary. Non-finite real logits
+invalidate that trace. After probability at a returned pick is not calibrated
+confidence in the boundary time.
+
+Compare the same weights and batch size without lateral cleaning first:
+
+```bash
+python /home/mika/dev/seismic_activity/train/fbp_eval.py \
+  --ckpt-dir /home/mika/dev/seismic_activity/fold_results/train_fold_A \
+  --fold A --backend hdf5 --data-dir /tmp/data \
+  --before-after-decoder legacy
+
+python /home/mika/dev/seismic_activity/train/fbp_eval.py \
+  --ckpt-dir /home/mika/dev/seismic_activity/fold_results/train_fold_A \
+  --fold A --backend hdf5 --data-dir /tmp/data \
+  --before-after-decoder change_point
+```
+
+Use the data directory on your machine. Evaluation overrides do not rewrite the
+checkpoint. `metrics.json` and `report.md` record the active decoder;
+`smooth_threshold` is null in change-point evaluation reports because
+`--smooth-threshold` applies **only to legacy**. Then repeat with identical
+`--lateral-clean` settings if desired. Compare missing-pick rate as well as
+MAE/RMSE and large-error tails; reduced coverage is not an accuracy improvement.
+Fresh inference is required unless full logits were saved; per-trace pick tables
+cannot be re-decoded.
+
+For future training, the same CLI flag or YAML `before_after_decoder: change_point`
+is saved in model/checkpoint hyperparameters and used during validation. Model
+config overrides recipe YAML; CLI overrides both. Exact resume rejects a decoder
+change (old missing metadata equals legacy); weights-only initialization permits
+it. This changes validation/checkpoint selection, not cross-entropy gradients.
+
+The Python prediction APIs `predict_first_breaks_ms` and
+`predict_first_breaks_ms_from_shot_gather` accept
+`before_after_decoder="change_point"`; omitted means the checkpoint's decoder.
+The viewer uses the saved decoder through these APIs (no new UI override).
+
+This decoder can reject small false early after-regions, but cannot reliably fix
+a network that confidently supports a wrong sustained early boundary. No
+lateral smoothing, persistence-window rule, or new confidence threshold is
+introduced by this option.
+
 ## Resume versus weights-only initialization
 
 `--ckpt` / `--ckpt-dir` resumes optimizer, epoch and the manually managed scheduler.

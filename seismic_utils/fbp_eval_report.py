@@ -479,6 +479,7 @@ def write_index_html(path: Path, *, title: str, metrics: Dict[str, Any], links: 
         for k, v in metrics.items()
         if k
         in {
+            "before_after_decoder",
             "n_gathers",
             "n_traces",
             "n_labeled",
@@ -525,6 +526,8 @@ def write_report_md(
         f"# FBP validation — {meta.get('run_name', '')}",
         "",
         f"- **Picker:** {meta.get('picker', 'fbpunet')}",
+        *([f"- **Before/after decoder:** {metrics.get('before_after_decoder', 'legacy')}"]
+          if meta.get("picker") == "before_after" else []),
         f"- **Checkpoint:** `{meta.get('checkpoint', '')}`",
         f"- **Config:** `{meta.get('model_config', '')}`",
         f"- **Encoder:** {meta.get('encoder', '')}",

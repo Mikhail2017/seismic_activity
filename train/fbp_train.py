@@ -64,7 +64,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from seismic_utils.dataset import DEFAULT_DATA_DIR
-from seismic_utils.fb_smooth import DEFAULT_SMOOTH_THRESHOLD
+from seismic_utils.fb_smooth import BEFORE_AFTER_DECODERS, DEFAULT_SMOOTH_THRESHOLD
 from seismic_utils.hardpicks_bridge import hardpicks_available, resolve_hardpicks_site_info
 from seismic_utils.hardpicks_pl_compat import ensure_hardpicks_lightning_compat
 from seismic_utils.npz_parser import create_npz_parser
@@ -72,6 +72,7 @@ from seismic_utils.pickers import (
     PICKER_BEFORE_AFTER,
     PICKER_FBPUNET,
     attach_smooth_evaluators,
+    before_after_decoder_from_hparams,
     parse_model_suffixes,
     picker_from_hparams,
     spec_for,
@@ -553,11 +554,15 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         ),
     )
     p.add_argument(
+        "--before-after-decoder", choices=BEFORE_AFTER_DECODERS, default=None,
+        help="Before/after boundary selection (default: legacy; saved in checkpoint metadata).",
+    )
+    p.add_argument(
         "--smooth-threshold",
         type=int,
         default=None,
         help=(
-            "Before/after pick smoother window in samples "
+            "Legacy before/after pick smoother window in samples (unused by change_point) "
             f"(default: {DEFAULT_SMOOTH_THRESHOLD}; used with --picker before_after)."
         ),
     )
@@ -811,6 +816,7 @@ def build_model_config(
     recipe: Optional[Dict[str, Any]] = None,
     picker: Optional[str] = None,
     smooth_threshold: Optional[int] = None,
+    before_after_decoder: Optional[str] = None,
     geonorm: Optional[Dict[str, Any]] = None,
 ) -> tuple[Dict[str, Any], str]:
     """Build FBPUNet hyperparams from a preset and/or YAML/JSON override.
@@ -964,6 +970,16 @@ def build_model_config(
     picker_spec = spec_for(resolved_picker)
     base["picker"] = picker_spec.name
     base["segm_class_count"] = int(picker_spec.segm_class_count or 1)
+    decoder = before_after_decoder if before_after_decoder is not None else base.get(
+        "before_after_decoder", recipe.get("before_after_decoder")
+    )
+    base["before_after_decoder"] = before_after_decoder_from_hparams({"before_after_decoder": decoder})
+    if picker_spec.name != PICKER_BEFORE_AFTER and (
+        before_after_decoder is not None or base["before_after_decoder"] != "legacy"
+    ):
+        raise ValueError("before_after_decoder requires picker=before_after")
+    if smooth_threshold is not None and base["before_after_decoder"] == "change_point":
+        logger.warning("--smooth-threshold is unused by the change_point decoder")
     base["segm_first_break_smooth_threshold"] = int(
         smooth_threshold if smooth_threshold is not None else base.get(
             "segm_first_break_smooth_threshold", recipe.get("smooth_threshold", DEFAULT_SMOOTH_THRESHOLD)
@@ -2066,6 +2082,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         recipe=getattr(args, "train_recipe", None),
         picker=args.picker,
         smooth_threshold=args.smooth_threshold,
+        before_after_decoder=args.before_after_decoder,
         geonorm=getattr(args, "geonorm_config", None),
     )
     model_config["training_data"] = {
@@ -2111,6 +2128,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "picker": model_config.get("picker"),
                 "segm_class_count": model_config.get("segm_class_count"),
                 "smooth_threshold": model_config.get("segm_first_break_smooth_threshold"),
+                "before_after_decoder": model_config.get("before_after_decoder"),
                 "fold": site_label if eval_ratio is None else None,
                 "train_sites": list(train_site_names),
                 "valid_sites": list(valid_site_names),

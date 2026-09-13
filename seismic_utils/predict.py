@@ -81,11 +81,17 @@ def load_fbp_model(ckpt_path: str | Path, *, device: str | None = None):
     return model
 
 
-def decode_fb_picks(raw_preds, model, *, picker: str | None = None, smooth_threshold: int | None = None):
+def decode_fb_picks(
+    raw_preds, model, *, picker: str | None = None, smooth_threshold: int | None = None,
+    before_after_decoder: str | None = None, sample_counts=None,
+):
     """Logits → per-trace sample indices."""
     from .pickers import decode_nn_picks
 
-    return decode_nn_picks(raw_preds, model, picker=picker, smooth_threshold=smooth_threshold)
+    return decode_nn_picks(
+        raw_preds, model, picker=picker, smooth_threshold=smooth_threshold,
+        before_after_decoder=before_after_decoder, sample_counts=sample_counts,
+    )
 
 
 def shot_gather_to_inference_dict(
@@ -158,6 +164,7 @@ def predict_first_breaks_ms(
     *,
     picker: str | None = None,
     smooth_threshold: int | None = None,
+    before_after_decoder: str | None = None,
     lateral_clean: bool = False,
     lateral_clean_opts: Mapping[str, Any] | None = None,
 ) -> np.ndarray:
@@ -169,6 +176,8 @@ def predict_first_breaks_ms(
 
     *picker* selects the decode head (``fbpunet`` vs ``before_after``). Default:
     checkpoint ``hparams.picker`` / ``segm_class_count``.
+    *before_after_decoder* overrides the saved selection rule (legacy if absent).
+    *smooth_threshold* applies only to the legacy decoder.
     *lateral_clean* replaces isolated pick outliers using neighboring traces.
     """
     import torch
@@ -202,7 +211,8 @@ def predict_first_breaks_ms(
             geom = geom.to(model.device).float()
         logits = model(input_tensor, geom=geom if getattr(model, "use_geonorm", False) else None)
         pred_idx, _ = decode_fb_picks(
-            logits, model, picker=resolved_picker, smooth_threshold=smooth_threshold
+            logits, model, picker=resolved_picker, smooth_threshold=smooth_threshold,
+            before_after_decoder=before_after_decoder, sample_counts=batch["sample_count"],
         )
 
     idx = pred_idx[0, :n_traces].detach().cpu().numpy().astype(np.float64)
@@ -226,6 +236,7 @@ def predict_first_breaks_ms_from_shot_gather(
     *,
     picker: str | None = None,
     smooth_threshold: int | None = None,
+    before_after_decoder: str | None = None,
     lateral_clean: bool = False,
     lateral_clean_opts: Mapping[str, Any] | None = None,
 ) -> np.ndarray:
@@ -235,6 +246,7 @@ def predict_first_breaks_ms_from_shot_gather(
         shot_gather_to_inference_dict(gather),
         picker=picker,
         smooth_threshold=smooth_threshold,
+        before_after_decoder=before_after_decoder,
         lateral_clean=lateral_clean,
         lateral_clean_opts=lateral_clean_opts,
     )
