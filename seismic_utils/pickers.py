@@ -61,26 +61,55 @@ def spec_for(name: str | None) -> PickerSpec:
     return SPECS[normalize_picker(name)]
 
 
+def parse_model_suffixes(name: str) -> tuple[str, bool, bool]:
+    """Split encoder + optional ``-before-after`` / ``-horizon`` (any order).
+
+    ``resnet18-before-after-horizon`` → ``('resnet18', True, True)``.
+    ``-horizon`` is the first-break prior channel in train, not a picker.
+    """
+    raw = (name or "").strip()
+    if not raw:
+        return raw, False, False
+    key = raw.lower().replace("_", "-")
+    is_ba = False
+    is_horizon = False
+    while True:
+        if key.endswith(HORIZON_SUFFIX):
+            base = key[: -len(HORIZON_SUFFIX)].rstrip("-")
+            if not base:
+                raise ValueError("'-horizon' needs an encoder preset, e.g. resnet18-horizon")
+            key = base
+            is_horizon = True
+            continue
+        if key.endswith(BEFORE_AFTER_SUFFIX):
+            base = key[: -len(BEFORE_AFTER_SUFFIX)].rstrip("-")
+            if not base:
+                raise ValueError(
+                    "'-before-after' needs an encoder preset, e.g. resnet18-before-after"
+                )
+            key = base
+            is_ba = True
+            continue
+        break
+    return key, is_ba, is_horizon
+
+
 def split_before_after_model(name: str) -> tuple[str, bool]:
     """Split ``resnet34-before-after`` → ``(resnet34, True)``.
 
     ``-horizon`` is the first-break prior channel in train, not this picker.
+    Combined labels keep the prior suffix on the returned encoder key so
+    ``resnet18-before-after-horizon`` → ``('resnet18-horizon', True)``.
     """
-    raw = (name or "").strip()
-    if not raw:
-        return raw, False
-    key = raw.lower().replace("_", "-")
-    if key.endswith(BEFORE_AFTER_SUFFIX):
-        base = key[: -len(BEFORE_AFTER_SUFFIX)].rstrip("-")
-        if not base:
-            raise ValueError("'-before-after' needs an encoder preset, e.g. resnet34-before-after")
-        return base, True
-    return raw, False
+    base, is_ba, is_horizon = parse_model_suffixes(name)
+    if is_horizon:
+        return f"{base}{HORIZON_SUFFIX}", is_ba
+    return base, is_ba
 
 
 def split_horizon_model(name: str) -> tuple[str, str]:
-    """Split ``resnet34-before-after`` → ``(resnet34, before_after)``."""
-    base, is_ba = split_before_after_model(name)
+    """Split ``resnet18-before-after-horizon`` → ``(resnet18, before_after)``."""
+    base, is_ba, _ = parse_model_suffixes(name)
     return base, PICKER_BEFORE_AFTER if is_ba else PICKER_FBPUNET
 
 

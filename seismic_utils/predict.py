@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import json
-from typing import Any
+from typing import Any, Mapping
 
 import numpy as np
 
@@ -158,6 +158,8 @@ def predict_first_breaks_ms(
     *,
     picker: str | None = None,
     smooth_threshold: int | None = None,
+    lateral_clean: bool = False,
+    lateral_clean_opts: Mapping[str, Any] | None = None,
 ) -> np.ndarray:
     """
     Run the model on one hardpicks-style gather dict.
@@ -167,6 +169,7 @@ def predict_first_breaks_ms(
 
     *picker* selects the decode head (``fbpunet`` vs ``before_after``). Default:
     checkpoint ``hparams.picker`` / ``segm_class_count``.
+    *lateral_clean* replaces isolated pick outliers using neighboring traces.
     """
     import torch
     import hardpicks.data.fbp.data_module as fbp_data_module
@@ -203,6 +206,15 @@ def predict_first_breaks_ms(
         )
 
     idx = pred_idx[0, :n_traces].detach().cpu().numpy().astype(np.float64)
+    if lateral_clean:
+        from .pick_clean import clean_picks_lateral, lateral_clean_kwargs
+
+        offs = prepared.get("offset_distances")
+        off = None
+        if offs is not None:
+            off = np.asarray(offs, dtype=np.float64).reshape(n_traces, -1)[:n_traces, 0]
+        cleaned, _ = clean_picks_lateral(idx, off, **lateral_clean_kwargs(lateral_clean_opts))
+        idx = cleaned.astype(np.float64)
     fb_ms = idx * dt_ms
     fb_ms[idx <= 0] = np.nan
     return fb_ms
@@ -214,6 +226,8 @@ def predict_first_breaks_ms_from_shot_gather(
     *,
     picker: str | None = None,
     smooth_threshold: int | None = None,
+    lateral_clean: bool = False,
+    lateral_clean_opts: Mapping[str, Any] | None = None,
 ) -> np.ndarray:
     """Predict FB times from a native ``ShotGather`` (no hardpicks HDF5 open)."""
     return predict_first_breaks_ms(
@@ -221,4 +235,6 @@ def predict_first_breaks_ms_from_shot_gather(
         shot_gather_to_inference_dict(gather),
         picker=picker,
         smooth_threshold=smooth_threshold,
+        lateral_clean=lateral_clean,
+        lateral_clean_opts=lateral_clean_opts,
     )

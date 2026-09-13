@@ -19,6 +19,8 @@ Example::
         --fold A --backend hdf5 --rmse-above 7
     python train/fbp_eval.py --ckpt-dir output/train_foldA_resnet18-before-after-geomD_... \\
         --fold A --backend hdf5   # GeoNorm stats restored from the checkpoint
+    python train/fbp_eval.py --picker before_after --ckpt ... --fold A --backend hdf5 \\
+        --data-dir /tmp/data --lateral-clean
 """
 
 from __future__ import annotations
@@ -61,6 +63,13 @@ from seismic_utils.fbp_eval_report import (
     write_worst_html,
 )
 from seismic_utils.fb_smooth import DEFAULT_SMOOTH_THRESHOLD
+from seismic_utils.pick_clean import (
+    DEFAULT_LATERAL_MAX_DEV,
+    DEFAULT_LATERAL_MAX_FLAG_FRAC,
+    DEFAULT_LATERAL_MIN_ANCHORS,
+    DEFAULT_LATERAL_WINDOW,
+    apply_lateral_clean_to_frame,
+)
 from seismic_utils.hardpicks_bridge import hardpicks_available, hardpicks_item_to_shot_gather
 from seismic_utils.hardpicks_pl_compat import ensure_hardpicks_lightning_compat
 from seismic_utils.pickers import (
@@ -166,6 +175,38 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
             f"(default: checkpoint hparams or {DEFAULT_SMOOTH_THRESHOLD})."
         ),
     )
+    p.add_argument(
+        "--lateral-clean",
+        action="store_true",
+        help=(
+            "After decode, replace isolated pick outliers using neighboring traces "
+            "(predictions only; labels unchanged). See TRAINING.md."
+        ),
+    )
+    p.add_argument(
+        "--lateral-window",
+        type=int,
+        default=DEFAULT_LATERAL_WINDOW,
+        help="Receiver-axis window (traces) for the local pick median.",
+    )
+    p.add_argument(
+        "--lateral-max-dev",
+        type=float,
+        default=DEFAULT_LATERAL_MAX_DEV,
+        help="Flag a pick if it differs from the local median by more than this many samples.",
+    )
+    p.add_argument(
+        "--lateral-max-flag-frac",
+        type=float,
+        default=DEFAULT_LATERAL_MAX_FLAG_FRAC,
+        help="Skip a gather when this fraction of valid picks would be flagged (systematic miss).",
+    )
+    p.add_argument(
+        "--lateral-min-anchors",
+        type=int,
+        default=DEFAULT_LATERAL_MIN_ANCHORS,
+        help="Minimum unflagged picks required before interpolating replacements.",
+    )
     p.add_argument("-v", "--verbose", action="store_true")
     p.add_argument("--list-folds", action="store_true")
     args = p.parse_args(argv)
@@ -175,6 +216,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         p.error("--rmse-above must be a finite number")
     if args.min_labeled < 0:
         p.error("--min-labeled must be >= 0")
+    if args.lateral_window < 1:
+        p.error("--lateral-window must be >= 1")
+    if args.lateral_max_dev <= 0:
+        p.error("--lateral-max-dev must be > 0")
+    if not 0 < args.lateral_max_flag_frac <= 1:
+        p.error("--lateral-max-flag-frac must be in (0, 1]")
+    if args.lateral_min_anchors < 2:
+        p.error("--lateral-min-anchors must be >= 2")
     return args
 
 
@@ -572,6 +621,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
 
     traces_raw, evaluator_summary, mean_loss = run_eval(model, loader, device, evaluator)
+    n_lateral = 0
+    if args.lateral_clean:
+        traces_raw, n_lateral = apply_lateral_clean_to_frame(
+            traces_raw,
+            window=args.lateral_window,
+            max_dev_samples=args.lateral_max_dev,
+            max_flag_frac=args.lateral_max_flag_frac,
+            min_anchors=args.lateral_min_anchors,
+        )
+        logger.info("Lateral clean: replaced %d pick(s)", n_lateral)
+        print(f"Lateral clean: replaced {n_lateral} pick(s)")
     dt_by_origin = collect_sample_rates(parser, site_names)
     traces = annotate_trace_frame(
         traces_raw,
@@ -583,6 +643,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     metrics["picker"] = resolved_picker
     if resolved_picker == PICKER_BEFORE_AFTER:
         metrics["smooth_threshold"] = hp.get("segm_first_break_smooth_threshold")
+    if args.lateral_clean:
+        metrics["lateral_clean"] = {
+            "enabled": True,
+            "n_replaced": n_lateral,
+            "window": args.lateral_window,
+            "max_dev_samples": args.lateral_max_dev,
+            "max_flag_frac": args.lateral_max_flag_frac,
+            "min_anchors": args.lateral_min_anchors,
+        }
     metrics["evaluator"] = {
         str(k): (float(v) if np.isfinite(float(v)) else None) for k, v in evaluator_summary.items()
     }
@@ -691,6 +760,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "backend": args.backend,
         "smooth_threshold": metrics.get("smooth_threshold"),
         "rmse_above": args.rmse_above,
+        "lateral_clean": metrics.get("lateral_clean"),
     }
     write_report_md(
         report_dir / "report.md",

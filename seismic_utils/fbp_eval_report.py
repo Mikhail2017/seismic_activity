@@ -531,6 +531,7 @@ def write_report_md(
         f"- **Sites:** {', '.join(meta.get('sites') or [])}",
         f"- **Fold:** {meta.get('fold') or '—'}",
         f"- **Backend:** {meta.get('backend', '')}",
+        f"- **Lateral clean:** {_lateral_clean_line(meta, metrics)}",
         f"- **Gathers:** {metrics.get('n_gathers')}  |  traces: {metrics.get('n_traces')}  "
         f"| labeled: {metrics.get('n_labeled')}",
         "",
@@ -606,6 +607,18 @@ def write_report_md(
     path = Path(path)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return path
+
+
+def _lateral_clean_line(meta: Dict[str, Any], metrics: Dict[str, Any]) -> str:
+    info = metrics.get("lateral_clean") or meta.get("lateral_clean")
+    if not info:
+        return "off"
+    if isinstance(info, dict):
+        n_rep = info.get("n_replaced", "—")
+        window = info.get("window", "—")
+        dev = info.get("max_dev_samples", "—")
+        return f"on (replaced {n_rep}; window={window}; max_dev={dev} samples)"
+    return str(info)
 
 
 def _fmt(value: Any) -> str:

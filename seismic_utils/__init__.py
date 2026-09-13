@@ -36,6 +36,12 @@ from .sta_lta import (
     pick_first_breaks_ms_from_shot_gather,
 )
 from .fb_smooth import DEFAULT_SMOOTH_THRESHOLD, fb_smooth_from_logits, fb_smooth_result
+from .pick_clean import (
+    DEFAULT_LATERAL_MAX_DEV,
+    DEFAULT_LATERAL_WINDOW,
+    apply_lateral_clean_to_frame,
+    clean_picks_lateral,
+)
 from .pickers import (
     ALL_PICKERS,
     HORIZON_SUFFIX,
@@ -50,6 +56,7 @@ from .pickers import (
     normalize_picker,
     picker_from_hparams,
     picker_from_model,
+    parse_model_suffixes,
     spec_for,
     split_before_after_model,
     split_horizon_model,
@@ -86,6 +93,10 @@ __all__ = [
     "resolve_site_config",
     "ALL_PICKERS",
     "DEFAULT_SMOOTH_THRESHOLD",
+    "DEFAULT_LATERAL_MAX_DEV",
+    "DEFAULT_LATERAL_WINDOW",
+    "apply_lateral_clean_to_frame",
+    "clean_picks_lateral",
     "BEFORE_AFTER_SUFFIX",
     "HORIZON_SUFFIX",
     "NN_PICKERS",
@@ -100,6 +111,7 @@ __all__ = [
     "fb_smooth_result",
     "normalize_picker",
     "picker_from_hparams",
+    "parse_model_suffixes",
     "picker_from_model",
     "spec_for",
     "split_before_after_model",
