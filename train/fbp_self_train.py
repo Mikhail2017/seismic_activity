@@ -68,6 +68,19 @@ from seismic_utils.pickers import (
 )
 from seismic_utils.predict import resolve_checkpoint
 from seismic_utils.pseudo_label_qc import draw_without_replacement, qc_gather_picks
+from seismic_utils.self_train_diagnostics import (
+    SCHEMA_VERSION,
+    AnnotationSourceDataset,
+    SelfTrainDiagnostics,
+    code_identity,
+    describe_geometry,
+    effective_protocol,
+    json_value,
+    prediction_counts,
+    split_identity,
+    write_json,
+    write_pseudo_shard,
+)
 from seismic_utils.training_state import load_checkpoint, reserve_run_directory, run_token
 from seismic_utils.validation import IndexedValidationDataset
 
@@ -271,10 +284,11 @@ def _inner_fit(
     tbx = pl.loggers.TensorBoardLogger(save_dir=str(output_dir / "tensorboard"), name="default", version=0, default_hp_metric=False)
     csv_logger = pl.loggers.CSVLogger(save_dir=str(output_dir / "csv_logs"), name="metrics", version=0)
     ckpt_cb = train_cli.make_model_checkpoint(output_dir, save_top_k=1)
+    diagnostics = SelfTrainDiagnostics(output_dir)
     trainer = train_cli.make_trainer(
         tbx_logger=tbx,
         csv_logger=csv_logger,
-        callbacks=[ckpt_cb],
+        callbacks=[diagnostics, ckpt_cb],
         max_epochs=int(epochs),
         log_every_n_steps=10,
         accelerator=accelerator,
@@ -285,6 +299,9 @@ def _inner_fit(
     )
     trainer.fit(model, train_loader, valid_loader)
     best = Path(ckpt_cb.best_model_path).resolve() if ckpt_cb.best_model_path else None
+    checkpoint = load_checkpoint(best) if best and best.is_file() else None
+    if trainer.is_global_zero:
+        write_json(output_dir / "fit_diagnostics.json", diagnostics.fit_summary(trainer, best, checkpoint))
     return best if best and best.is_file() else None
 
 
@@ -304,12 +321,21 @@ def _infer_qc(model, dataset, device: torch.device) -> tuple[dict, list[dict[str
             picks, _ = decode_argmax_fb_unpicked(logits)
             n = int(item.get("trace_count") or item["samples"].shape[0])
             pred = picks[0, :n].detach().cpu().numpy().astype(np.float64)
+            sample_count = int(item["sample_count"])
+            counts = prediction_counts(pred, sample_count)
             pred[pred <= 0] = np.nan
             offs = item.get("offset_distances")
             off = np.asarray(offs, dtype=np.float64).reshape(n, -1)[:n, 0] if offs is not None else np.full(n, np.nan)
             qc = qc_gather_picks(off, pred)
             key = gather_key(item)
-            rec = {"key": list(key), "admit": qc["admit"], "survive_frac": qc["survive_frac"]}
+            rec = {
+                "key": list(key), "admit": qc["admit"], "survive_frac": qc["survive_frac"],
+                **counts, "n_survive": qc["n_survive"], "sample_count": sample_count,
+                "padded_shape": list(batch["samples"].shape[-2:]),
+                "receiver_ids": np.asarray(item["rec_ids"])[:n].tolist(),
+                "sample_rate_ms": float(item.get("sample_rate_ms") or 2.0),
+                "n_admitted_out_of_range": int(np.sum(qc["picks"] >= sample_count)),
+            }
             stats.append(rec)
             if qc["admit"]:
                 accepted[key] = qc["picks"][:n]
@@ -460,6 +486,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     recipe = _load_recipe(args.config)
+    requested_recipe = dict(recipe)
     _refuse_incompatible(recipe, args)
     if args.smoke:
         args.sites = args.sites or "Halfmile"
@@ -528,7 +555,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     stamp = run_token(datetime.now().strftime("%Y%m%d_%H%M%S_%f"))
     out_root = (args.output_dir or (REPO_ROOT / "output" / f"self_train_{site.lower()}_{ablation}_{stamp}")).resolve()
-    out_root.mkdir(parents=True, exist_ok=True)
+    reserve_run_directory(out_root)
     write_split(split, out_root / "split.json")
 
     labeled_ds = MinimalAnnotationDataset(parser, train_idx, mode="labeled", window_ms=window_ms)
@@ -536,10 +563,45 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     test_ds = MinimalAnnotationDataset(parser, pool_idx, mode="oracle", window_ms=window_ms)
 
     devices = train_cli.parse_devices(args.devices)
+    identity = split_identity(split)
+    effective = {
+        "schema_version": SCHEMA_VERSION,
+        "run_id": stamp, "site": site, "seed": seed, "ablation": ablation,
+        "recipe_path": str(args.config.resolve()), "requested_recipe": requested_recipe,
+        "arguments": vars(args), "model_label": model_label, "model_config": model_config,
+        "code": code_identity(REPO_ROOT),
+        "environment": {"python": sys.version, "torch": torch.__version__,
+                        "lightning": pl.__version__, "numpy": np.__version__},
+        "split": {**identity, "path": str(out_root / "split.json"),
+                  "source": str(args.split_json.resolve()) if args.split_json else "generated"},
+        "data": {"backend": backend, "data_dir": str(args.data_dir.resolve()),
+                 "npz_root": str(npz_root.resolve()), "augment": False,
+                 "parser_normalize_samples": False, "parser_segm_first_break_buffer": 0},
+        "training": {"n_iters": n_iters, "inner_epochs": inner_epochs,
+                     "iterative": iterative, "n_draw": int(args.n_draw),
+                     "reset_after": sorted(RESET_AFTER), "batch_size": batch_size,
+                     "num_workers": num_workers, "precision_requested": precision,
+                     "devices_requested": devices, "accelerator_requested": args.accelerator,
+                     "inner_seed_rule": "seed + iteration", "log_every_n_steps": 10,
+                     "qc_device_policy": "cuda_if_available_else_cpu", "qc_batch_size": 1},
+        "protocol": effective_protocol(model_config, window_ms, train_cli.MONITOR_METRIC),
+        "geometry": {
+            name: describe_geometry(parser, indices, window_ms)
+            for name, indices in (("labeled_train", train_idx), ("labeled_val", val_idx),
+                                  ("unlabeled_pool", pool_idx))
+        },
+    }
+    write_json(out_root / "effective_config.json", effective)
+    (out_root / "effective_config.yaml").write_text(yaml.safe_dump(json_value(effective), sort_keys=False))
     remaining = list(unlabeled_pool)
     accepted_pseudo: dict = {}
+    pseudo_shards: list[dict[str, Any]] = []
+    archive_path = out_root / "pseudo_labels.json"
+    write_json(archive_path, {"schema_version": SCHEMA_VERSION, "split_sha256": identity["sha256"],
+                              "n_gathers": 0, "shards": []})
     last_ckpt: Optional[Path] = None
     history: List[dict[str, Any]] = []
+    cycle = 1
 
     print(
         f"Site {site} ablation={ablation} seed={seed} labelled={len(labeled_train)}/{len(labeled_val)} "
@@ -548,15 +610,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     for it in range(1, n_iters + 1):
         reset = last_ckpt is None and it > 1
+        if reset:
+            cycle += 1
         init = last_ckpt
         iter_dir = out_root / f"iter_{it:02d}"
         pseudo_keys = list(accepted_pseudo.keys())
-        parts = [labeled_ds]
+        parts = [AnnotationSourceDataset(labeled_ds, source=0)]
         if pseudo_keys:
             pidx = indices_for_keys(parser, pseudo_keys)
             parts.append(
-                MinimalAnnotationDataset(
-                    parser, pidx, mode="pseudo", window_ms=window_ms, pseudo_picks=accepted_pseudo
+                AnnotationSourceDataset(
+                    MinimalAnnotationDataset(
+                        parser, pidx, mode="pseudo", window_ms=window_ms, pseudo_picks=accepted_pseudo
+                    ), source=1,
                 )
             )
         if len(parts) == 1:
@@ -582,7 +648,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             seed=seed + it,
         )
         last_ckpt = best or last_ckpt
-        rec = {"iteration": it, "n_train": len(train_ds), "ckpt": str(best) if best else None}
+        fit_diagnostics = json.loads((iter_dir / "fit_diagnostics.json").read_text())
+        rec = {
+            "schema_version": SCHEMA_VERSION,
+            "iteration": it, "cycle": cycle, "seed": seed + it,
+            "n_train": len(train_ds), "n_manual_train": len(labeled_ds), "n_pseudo_train": len(pseudo_keys),
+            "ckpt": str(best) if best else None, "init_ckpt": str(init) if init else None,
+            "teacher_checkpoint": None, "reset_before_fit": reset, "optimizer_restarted": True,
+            "n_drawn": 0, "n_admitted": 0, "n_pseudo_total": len(accepted_pseudo),
+            "n_remaining": len(remaining), "n_survive": 0, "n_admitted_picks": 0,
+            "n_admitted_out_of_range": 0,
+            "pixel_count_scope": fit_diagnostics["pixel_count_scope"],
+            "prediction_counts": prediction_counts([], 1),
+            "pixels": fit_diagnostics["pixels"],
+            "validation": fit_diagnostics["validation"],
+            "terminal_validation": fit_diagnostics["terminal_validation"],
+            "optimizer": {key: fit_diagnostics[key] for key in
+                          ("terminal_global_step", "terminal_optimizers", "selected_epoch", "selected_global_step")},
+            "fit_diagnostics": str(iter_dir / "fit_diagnostics.json"),
+        }
 
         if iterative and it < n_iters and remaining:
             if last_ckpt is None:
@@ -598,12 +682,30 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             model = fbp_unet.FBPUNet.load_from_checkpoint(str(last_ckpt), map_location="cpu")
             attach_unpicked_evaluators(model, dict(model.hparams))
             new_acc, qc_stats = _infer_qc(model, infer_ds, device)
+            rec["teacher_checkpoint"] = str(last_ckpt)
+            shard = write_pseudo_shard(
+                iter_dir / "pseudo_labels.json", new_acc, qc_stats,
+                iteration=it, teacher=last_ckpt, split_sha256=identity["sha256"],
+            )
+            pseudo_shards.append(shard)
             accepted_pseudo.update(new_acc)
+            write_json(archive_path, {
+                "schema_version": SCHEMA_VERSION, "split_sha256": identity["sha256"],
+                "n_gathers": len(accepted_pseudo), "shards": pseudo_shards,
+            })
             rec.update(
                 {
                     "n_drawn": len(drawn),
                     "n_admitted": len(new_acc),
                     "n_pseudo_total": len(accepted_pseudo),
+                    "n_remaining": len(remaining),
+                    "n_survive": sum(row["n_survive"] for row in qc_stats),
+                    "n_admitted_picks": shard["n_picks"],
+                    "prediction_counts": {
+                        key: sum(row[key] for row in qc_stats) for key in prediction_counts([], 1)
+                    },
+                    "n_admitted_out_of_range": sum(row["n_admitted_out_of_range"] for row in qc_stats),
+                    "pseudo_artifact": shard,
                     "drawn": [key_to_dict(k) for k in drawn],
                     "remaining": [key_to_dict(k) for k in remaining],
                     "qc": qc_stats,
@@ -614,10 +716,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 rec["weight_reset"] = True
                 print(f"Weight reset after iteration {it}")
         iter_name = f"iter_{it:02d}.json"
-        payload = json.dumps(rec, indent=2, default=str) + "\n"
-        (iter_dir / "iter.json").write_text(payload)
-        (out_root / iter_name).write_text(payload)
+        write_json(iter_dir / "iter.json", rec)
+        write_json(out_root / iter_name, rec)
         history.append({k: v for k, v in rec.items() if k not in {"qc", "drawn", "remaining"}})
+        write_json(out_root / "iteration_history.json", history)
 
     metrics = {}
     report_dir = None
@@ -660,8 +762,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "best_ckpt": str(last_ckpt) if last_ckpt else None,
         "metrics_99pct": metrics,
         "report_dir": str(report_dir) if report_dir else None,
+        "effective_config": str(out_root / "effective_config.json"),
+        "split_sha256": identity["sha256"],
+        "pseudo_labels": str(archive_path),
     }
-    (out_root / "self_train_state.json").write_text(json.dumps(state, indent=2, default=str) + "\n")
+    write_json(out_root / "self_train_state.json", state)
     print("Wrote", out_root / "self_train_state.json")
     return 0
 

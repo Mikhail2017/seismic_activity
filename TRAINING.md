@@ -190,6 +190,45 @@ traces. \(W_{total}(10)\) is the paper’s end-to-end number. After the last fit
 run writes `report/index.html` (worst + typical gather galleries, Plotly stats,
 `metrics.json`, trace table) next to `split.json`. Reuse a split with `--split-json`.
 
+### Stage 0: comparison and audit artifacts
+
+Self-training now refuses a non-empty output directory **before writing the
+split**. Use a new output directory and the old `split.json` with `--split-json`
+for a paired comparison. The split's original seed and the current training
+seed are saved separately.
+
+Every run writes the following under its output directory:
+
+| Artifact | Contents |
+|---|---|
+| `effective_config.json` / `effective_config.yaml` | Requested recipe/arguments, resolved model configuration, actual preprocessing/loss/decoder/checkpoint policies, split SHA-256, geometry/window histograms, training settings, dependency versions, Git revision/status and working-source hashes |
+| `iter_XX/epoch_diagnostics.json` | Actual training pixel exposures by manual/pseudo source, real ignored pixels versus ignored padding, observed padded batch shapes, optimizer counters, and validation timing metrics per epoch (sanity validation excluded) |
+| `iter_XX/fit_diagnostics.json` | Epoch diagnostics plus actual device/precision/loss settings, terminal optimizer counters, selected checkpoint epoch/step and selected versus terminal validation metrics |
+| `iter_XX.json` / `iter_XX/iter.json` | Cycle/seed, manual/pseudo gather counts before training, QC draw/admission/survival counts, invalid/out-of-range predictions, teacher checkpoint, and artifact references |
+| `iteration_history.json` | Compact history updated after each completed iteration |
+| `iter_XX/pseudo_labels.json` | Newly admitted gathers' raw QC picks, receiver order, teacher checkpoint, generation iteration, decoder version and split identity; written only when expansion runs |
+| `pseudo_labels.json` | Cumulative index of immutable pseudo-label shards with SHA-256 checksums; labels remain indexed across weight resets |
+
+Pixel totals count **actual training exposures**, not unique dataset pixels:
+they include repetitions across epochs and any distributed-sampler repeats.
+The current padding is batch-dependent, so the effective configuration records
+`fixed_shape: null`, geometry-derived upper bounds, and the epoch diagnostics
+record the shapes actually seen. Training windows remain millisecond-based;
+validation segmentation masks remain point masks. Validation timing diagnostics
+reuse the existing manual-pick evaluator, in samples, without extra forward
+passes. `validation` refers to the selected checkpoint; `terminal_validation`
+refers to the final epoch. These diagnostic metrics do **not** select checkpoints.
+
+Stage 0 deliberately does not change decoding, loss, QC, or optimizer behavior.
+In particular, out-of-range picks are counted and archived as emitted by QC,
+not repaired. Missing archived picks are JSON `null` (loaded as NumPy NaN).
+`load_pseudo_archive` in `seismic_utils.self_train_diagnostics` reads the index,
+verifies checksums/split identity, and returns pick and provenance dictionaries
+keyed like the split. Shard paths are absolute; keep the run directory at its
+original location when using this reader. These are audit artifacts, **not an
+exact-resume implementation**. Final pool evaluation still uses original manual
+picks, including for admitted pseudo-labelled gathers.
+
 ## Regression validation
 
 Run from the repository root in the `seismic_activity` environment:
