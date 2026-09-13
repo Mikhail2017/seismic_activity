@@ -61,13 +61,20 @@ from seismic_utils.fbp_eval_report import (
     write_worst_html,
 )
 from seismic_utils.fb_smooth import DEFAULT_SMOOTH_THRESHOLD
-from seismic_utils.pick_clean import (
-    DEFAULT_LATERAL_MAX_DEV,
-    DEFAULT_LATERAL_MAX_FLAG_FRAC,
-    DEFAULT_LATERAL_MIN_ANCHORS,
-    DEFAULT_LATERAL_WINDOW,
-    apply_lateral_clean_to_frame,
-)
+try:
+    from seismic_utils.pick_clean import (
+        DEFAULT_LATERAL_MAX_DEV,
+        DEFAULT_LATERAL_MAX_FLAG_FRAC,
+        DEFAULT_LATERAL_MIN_ANCHORS,
+        DEFAULT_LATERAL_WINDOW,
+        apply_lateral_clean_to_frame,
+    )
+except ImportError:  # optional post-decode cleaner
+    DEFAULT_LATERAL_MAX_DEV = 15
+    DEFAULT_LATERAL_MAX_FLAG_FRAC = 0.30
+    DEFAULT_LATERAL_MIN_ANCHORS = 3
+    DEFAULT_LATERAL_WINDOW = 15
+    apply_lateral_clean_to_frame = None
 from seismic_utils.hardpicks_bridge import hardpicks_available, hardpicks_item_to_shot_gather
 from seismic_utils.hardpicks_pl_compat import ensure_hardpicks_lightning_compat
 from seismic_utils.pickers import (
@@ -581,6 +588,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     traces_raw, evaluator_summary, mean_loss = run_eval(model, loader, device, evaluator)
     n_lateral = 0
     if args.lateral_clean:
+        if apply_lateral_clean_to_frame is None:
+            raise SystemExit("--lateral-clean requires seismic_utils.pick_clean")
         traces_raw, n_lateral = apply_lateral_clean_to_frame(
             traces_raw,
             window=args.lateral_window,

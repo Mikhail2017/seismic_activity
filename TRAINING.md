@@ -184,10 +184,11 @@ augmentation, per-trace z-score then int16 quantize, batch pad to a multiple of
 Picks are the per-trace argmax of the FB logit; a trace is unpicked if background
 wins everywhere.
 
-Headline metrics on the 99% pool: coverage, \(W_{pred}(x)\) / \(W_{total}(x)\)
-for \(x \in \{0,2,5,10\}\), MAE on predicted traces. \(W_{total}(10)\) is the
-paper’s end-to-end number. Splits are written to `split.json` (reuse with
-`--split-json`).
+Headline metrics on the 99% pool match `fbp_eval.py`: HitRate, MAE/RMSE, coverage,
+\(W_{pred}(x)\) / \(W_{total}(x)\) for \(x \in \{0,2,5,10\}\), and MAE on predicted
+traces. \(W_{total}(10)\) is the paper’s end-to-end number. After the last fit the
+run writes `report/index.html` (worst + typical gather galleries, Plotly stats,
+`metrics.json`, trace table) next to `split.json`. Reuse a split with `--split-json`.
 
 ## Regression validation
 

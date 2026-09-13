@@ -27,9 +27,22 @@ for path in (str(REPO_ROOT), str(TRAIN_DIR)):
     if path not in sys.path:
         sys.path.insert(0, path)
 
+import fbp_eval as eval_cli
 import fbp_train as train_cli
 from seismic_utils.dataset import DEFAULT_DATA_DIR
-from seismic_utils.fbp_eval_report import headline_metrics
+from seismic_utils.fbp_eval_report import (
+    MIN_GALLERY_LABELED,
+    annotate_trace_frame,
+    gather_summary,
+    headline_metrics,
+    offset_bin_table,
+    pick_gallery_gathers,
+    write_index_html,
+    write_report_md,
+    write_stats_html,
+    write_trace_table,
+    write_worst_html,
+)
 from seismic_utils.hardpicks_bridge import hardpicks_available
 from seismic_utils.hardpicks_pl_compat import ensure_hardpicks_lightning_compat
 from seismic_utils.minimal_preprocess import (
@@ -74,6 +87,26 @@ N_ITERS = 15
 N_DRAW = 200
 INNER_EPOCHS_ITER = 5
 INNER_EPOCHS_STATIC = 25
+HEADLINE_KEYS = (
+    "n_gathers",
+    "n_labeled",
+    "HitRate1px",
+    "HitRate5px",
+    "MeanAbsoluteError",
+    "MeanAbsoluteErrorMs",
+    "GatherCoverage",
+    "Coverage",
+    "W_pred_0",
+    "W_pred_2",
+    "W_pred_5",
+    "W_pred_10",
+    "W_total_0",
+    "W_total_2",
+    "W_total_5",
+    "W_total_10",
+    "MAE",
+    "loss",
+)
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
@@ -100,6 +133,20 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--accelerator", default="auto")
     p.add_argument("--precision", default=None)
     p.add_argument("--smoke", action="store_true", help="Tiny Halfmile loop for laptops.")
+    p.add_argument("--n-worst", type=int, default=8, help="Worst 99%% gathers to plot.")
+    p.add_argument("--n-typical", type=int, default=4, help="Typical 99%% gathers to plot.")
+    p.add_argument(
+        "--min-labeled",
+        type=int,
+        default=MIN_GALLERY_LABELED,
+        help="Minimum labeled traces for a gather to appear in worst/typical galleries.",
+    )
+    p.add_argument(
+        "--report-dir",
+        type=Path,
+        default=None,
+        help="Eval report directory (default: <output-dir>/report).",
+    )
     p.add_argument("-v", "--verbose", action="store_true")
     return p.parse_args(argv)
 
@@ -269,26 +316,141 @@ def _infer_qc(model, dataset, device: torch.device) -> tuple[dict, list[dict[str
     return accepted, stats
 
 
-def _eval_oracle(model, dataset, device: torch.device) -> dict[str, Any]:
-    from seismic_utils.fbp_eval_report import annotate_trace_frame
+def _eval_oracle(model, dataset, device: torch.device, dt_by_origin: dict[str, float]):
     from seismic_utils.pickers import make_eval_evaluator
 
     hp = dict(getattr(model, "hparams", {}) or {})
     evaluator = make_eval_evaluator(hp, "fbpunet")
     loader = _make_loader(dataset, batch_size=1, num_workers=0, shuffle=False, pin_memory=False)
-    model.eval()
-    evaluator.reset()
-    with torch.no_grad():
-        for batch_idx, batch in enumerate(loader):
-            tensors = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in batch.items()}
-            _, _, _ = model._generic_step(tensors, batch_idx, evaluator)
-    evaluator.finalize()
+    traces_raw, summary, mean_loss = eval_cli.run_eval(model, loader, device, evaluator)
     traces = annotate_trace_frame(
-        evaluator._dataframe.copy(),
+        traces_raw,
         origin_id_map=evaluator.origin_id_map,
-        sample_rate_ms_by_origin={},
+        sample_rate_ms_by_origin=dt_by_origin,
     )
-    return headline_metrics(traces)
+    metrics = headline_metrics(traces)
+    metrics["loss"] = mean_loss
+    metrics["picker"] = "fbpunet"
+    metrics["evaluator"] = {
+        str(k): (float(v) if np.isfinite(float(v)) else None) for k, v in summary.items()
+    }
+    return traces, metrics
+
+
+def _write_99pct_report(
+    *,
+    traces,
+    metrics: dict[str, Any],
+    parser,
+    site: str,
+    ablation: str,
+    seed: int,
+    ckpt: Path,
+    report_dir: Path,
+    n_worst: int,
+    n_typical: int,
+    min_labeled: int,
+    dt_by_origin: dict[str, float],
+) -> Path:
+    report_dir.mkdir(parents=True, exist_ok=True)
+    figs_dir = report_dir / "figs"
+    figs_dir.mkdir(exist_ok=True)
+
+    offset_df = offset_bin_table(traces)
+    gather_df = gather_summary(traces)
+    n_with_mae = int(gather_df["MAE"].notna().sum()) if "MAE" in gather_df.columns else 0
+    worst_df, typical_df = pick_gallery_gathers(
+        gather_df,
+        n_worst=n_worst,
+        n_typical=n_typical,
+        min_labeled=min_labeled,
+    )
+    if "n_labeled" in gather_df.columns and min_labeled > 0:
+        n_eligible = int(
+            ((gather_df["MAE"].notna()) & (gather_df["n_labeled"] >= min_labeled)).sum()
+        )
+        dropped = n_with_mae - n_eligible
+        if dropped:
+            logger.info(
+                "Gallery: dropped %d gather(s) with n_labeled < %d",
+                dropped,
+                min_labeled,
+            )
+
+    traces_path = write_trace_table(traces, report_dir / "traces")
+    (report_dir / "metrics.json").write_text(json.dumps(metrics, indent=2, default=str) + "\n")
+    if not offset_df.empty:
+        offset_df.to_csv(report_dir / "offset_bins.csv", index=False)
+    if not gather_df.empty:
+        gather_df.to_csv(report_dir / "gathers.csv", index=False)
+
+    gather_index = eval_cli.build_gather_index(parser)
+    worst_cards = eval_cli.plot_gallery(
+        worst_df,
+        parser=parser,
+        gather_index=gather_index,
+        traces=traces,
+        figs_dir=figs_dir,
+        prefix="worst",
+        dt_by_origin=dt_by_origin,
+        limit=n_worst,
+    )
+    typical_cards = eval_cli.plot_gallery(
+        typical_df,
+        parser=parser,
+        gather_index=gather_index,
+        traces=traces,
+        figs_dir=figs_dir,
+        prefix="typical",
+        dt_by_origin=dt_by_origin,
+        limit=n_typical,
+    )
+
+    write_stats_html(traces, metrics, offset_df, gather_df, report_dir / "stats.html")
+    write_worst_html(worst_cards, report_dir / "worst.html", title="Worst residual gathers (99% pool)")
+    write_worst_html(typical_cards, report_dir / "typical.html", title="Typical gathers (99% pool)")
+    run_name = f"self_train_{site.lower()}_{ablation}_seed{seed}_99pct"
+    cfg_path = ckpt.parent / "model_config.yaml"
+    encoder = "meneses"
+    if cfg_path.is_file():
+        loaded = yaml.safe_load(cfg_path.read_text()) or {}
+        if isinstance(loaded, dict):
+            encoder = str(loaded.get("unet_encoder_type") or loaded.get("model") or encoder)
+    write_report_md(
+        report_dir / "report.md",
+        meta={
+            "run_name": run_name,
+            "picker": "fbpunet",
+            "checkpoint": str(ckpt),
+            "model_config": str(cfg_path) if cfg_path.is_file() else "",
+            "encoder": encoder,
+            "sites": [site],
+            "fold": "99pct-manual",
+            "backend": "minimal_annotations",
+            "smooth_threshold": None,
+            "rmse_above": None,
+            "lateral_clean": None,
+        },
+        metrics=metrics,
+        offset_df=offset_df,
+        worst_names=[c["image"] for c in worst_cards],
+        typical_names=[c["image"] for c in typical_cards],
+        high_rmse_names=(),
+    )
+    write_index_html(
+        report_dir / "index.html",
+        title=f"FBP self-train 99% — {run_name}",
+        metrics=metrics,
+        links={
+            "Markdown report": "report.md",
+            "Plotly statistics": "stats.html",
+            "Worst gathers": "worst.html",
+            "Typical gathers": "typical.html",
+            "Trace table": traces_path.name,
+            "metrics.json": "metrics.json",
+        },
+    )
+    return report_dir
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -458,29 +620,36 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         history.append({k: v for k, v in rec.items() if k not in {"qc", "drawn", "remaining"}})
 
     metrics = {}
+    report_dir = None
     if last_ckpt is not None:
         import models.fbp.unet as fbp_unet
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         model = fbp_unet.FBPUNet.load_from_checkpoint(str(last_ckpt), map_location="cpu")
         attach_unpicked_evaluators(model, dict(model.hparams))
+        dt_by_origin = eval_cli.collect_sample_rates(parser, [site])
         print("\nEvaluating 99% pool against manual picks…")
-        metrics = _eval_oracle(model.to(device), test_ds, device)
+        traces, metrics = _eval_oracle(model.to(device), test_ds, device, dt_by_origin)
         print("Headline:")
-        for key in (
-            "n_labeled",
-            "Coverage",
-            "W_pred_0",
-            "W_pred_2",
-            "W_pred_5",
-            "W_pred_10",
-            "W_total_0",
-            "W_total_2",
-            "W_total_5",
-            "W_total_10",
-            "MAE",
-        ):
-            print(f"  {key:16s} {metrics.get(key)}")
+        for key in HEADLINE_KEYS:
+            print(f"  {key:24s} {metrics.get(key)}")
+        report_dir = (args.report_dir or (out_root / "report")).resolve()
+        _write_99pct_report(
+            traces=traces,
+            metrics=metrics,
+            parser=parser,
+            site=site,
+            ablation=ablation,
+            seed=seed,
+            ckpt=last_ckpt,
+            report_dir=report_dir,
+            n_worst=int(args.n_worst),
+            n_typical=int(args.n_typical),
+            min_labeled=int(args.min_labeled),
+            dt_by_origin=dt_by_origin,
+        )
+        print(f"\nReport: {report_dir / 'report.md'}")
+        print(f"Open:   {report_dir / 'index.html'}")
 
     state = {
         "site": site,
@@ -490,6 +659,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "n_pseudo": len(accepted_pseudo),
         "best_ckpt": str(last_ckpt) if last_ckpt else None,
         "metrics_99pct": metrics,
+        "report_dir": str(report_dir) if report_dir else None,
     }
     (out_root / "self_train_state.json").write_text(json.dumps(state, indent=2, default=str) + "\n")
     print("Wrote", out_root / "self_train_state.json")
