@@ -120,6 +120,35 @@ def test_attach_geom_features_writes_field():
     np.testing.assert_allclose(gather["geom_features"][:, 0], [0.0, 1.0], atol=1e-6)
 
 
+def test_geom_wrapper_getitems_does_not_bypass_attach():
+    class Inner:
+        def __len__(self):
+            return 3
+
+        def __getitem__(self, index):
+            return {
+                "trace_count": 2,
+                "rec_coords": np.array([[0.0, 0.0, 0.0], [4.0, 0.0, 0.0]]),
+                "shot_coords": np.zeros(3),
+                "offset_distances": np.array([[1.0, 0.0, 0.0], [3.0, 0.0, 0.0]], dtype=np.float32),
+            }
+
+        def __getitems__(self, indices):
+            raise AssertionError("inner __getitems__ must not run")
+
+        def get_meta_gather(self, gather_id):
+            return self[gather_id]
+
+    from seismic_utils.geom import GeomFeatureDataset
+
+    stats = GeomStats(dx_min=1.0, dx_max=3.0, dz_min=0.0, dz_max=1.0)
+    wrapped = GeomFeatureDataset(Inner(), stats)
+    batch = wrapped.__getitems__([0, 2])
+    assert len(batch) == 2
+    assert all("geom_features" in item for item in batch)
+    np.testing.assert_allclose(batch[0]["geom_features"][:, 0], [0.0, 1.0], atol=1e-6)
+
+
 @pytest.mark.parametrize(
     "raw, letter, inp, gn",
     [

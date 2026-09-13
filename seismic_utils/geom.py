@@ -17,12 +17,18 @@ _PAD_VALUE = 0.0
 
 def ensure_geom_pad_field() -> None:
     """Register ``geom_features`` so collate / flip / drop keep it aligned with traces."""
+    from hardpicks.data.fbp.gather_parser import ShotLineGatherDataset
     from hardpicks.data.fbp.gather_preprocess import ShotLineGatherPreprocessor
 
-    fields = ShotLineGatherPreprocessor.variable_length_fields
-    if any(name == GEOM_FIELD for name, _ in fields):
-        return
-    fields.append((GEOM_FIELD, _PAD_VALUE))
+    for cls in (ShotLineGatherDataset, ShotLineGatherPreprocessor):
+        fields = cls.variable_length_fields
+        if not any(name == GEOM_FIELD for name, _ in fields):
+            fields.append((GEOM_FIELD, _PAD_VALUE))
+
+
+def geom_worker_init(_worker_id: int) -> None:
+    """DataLoader worker hook: pad-field mutation is process-local under spawn."""
+    ensure_geom_pad_field()
 
 
 def _as_xy(coords: np.ndarray, n_traces: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -169,11 +175,31 @@ class GeomFeatureDataset:
         gather = self.dataset[index]
         return attach_geom_features(gather, self.stats)
 
+    def __getitems__(self, indices):
+        """PyTorch 2.x DataLoader batched fetch; must not fall through to the inner dataset."""
+        return [self[int(i)] for i in indices]
+
     def get_meta_gather(self, gather_id: int) -> dict[str, Any]:
         return self.dataset.get_meta_gather(gather_id)
 
     def __getattr__(self, name: str):
+        # Never forward dunders: hasattr(wrapper, "__getitems__") would otherwise
+        # bind the inner parser's method and skip attach_geom_features.
+        if name.startswith("__"):
+            raise AttributeError(name)
         return getattr(self.dataset, name)
+
+
+def collate_with_geom(batch, pad_to_nearest_pow2: bool = True, stats: GeomStats | None = None):
+    """Pad-aware collate that attaches ``geom_features`` if a worker skipped the wrapper."""
+    ensure_geom_pad_field()
+    if stats is not None:
+        for sample in batch:
+            if isinstance(sample, dict) and GEOM_FIELD not in sample:
+                attach_geom_features(sample, stats)
+    from hardpicks.data.fbp.collate import fbp_batch_collate
+
+    return fbp_batch_collate(batch, pad_to_nearest_pow2)
 
 
 def wrap_geom_features(parser, stats: GeomStats | Mapping[str, Any] | None):

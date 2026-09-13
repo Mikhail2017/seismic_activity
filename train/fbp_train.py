@@ -1191,17 +1191,28 @@ def build_loaders(
     pin_memory: bool = False,
     drop_last_train: bool = False,
     shuffle_train: bool = True,
+    geom_stats=None,
 ):
     import hardpicks.data.fbp.data_module as fbp_data_module
+    from seismic_utils.geom import collate_with_geom, geom_worker_init
 
     worker_kwargs: Dict[str, Any] = {}
     if num_workers > 0:
         worker_kwargs["persistent_workers"] = True
         worker_kwargs["prefetch_factor"] = 2
-    collate_fn = functools.partial(
-        fbp_data_module.fbp_batch_collate,
-        pad_to_nearest_pow2=True,
-    )
+        if geom_stats is not None:
+            worker_kwargs["worker_init_fn"] = geom_worker_init
+    if geom_stats is not None:
+        collate_fn = functools.partial(
+            collate_with_geom,
+            pad_to_nearest_pow2=True,
+            stats=geom_stats,
+        )
+    else:
+        collate_fn = functools.partial(
+            fbp_data_module.fbp_batch_collate,
+            pad_to_nearest_pow2=True,
+        )
     train_loader = torch.utils.data.DataLoader(
         dataset=train_parser,
         batch_size=batch_size,
@@ -2259,6 +2270,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 output_root / "geom_stats.yaml",
                 yaml.safe_dump(stats.to_dict(), sort_keys=False),
             )
+    else:
+        stats = None
     train_loader, valid_loader = build_loaders(
         train_parser,
         valid_parser,
@@ -2267,6 +2280,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         pin_memory=use_gpu,
         drop_last_train=n_devices > 1,
         shuffle_train=True,
+        geom_stats=stats,
     )
     print(
         f"Train batches: {len(train_loader)} | Valid batches: {len(valid_loader)} "

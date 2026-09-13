@@ -584,24 +584,35 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         getattr(model, "use_geonorm", False) or getattr(model, "use_geom_input_channels", False)
         or hp.get("use_geonorm") or hp.get("use_geom_input_channels")
     )
+    geom_stats = None
     if needs_geom:
-        from seismic_utils.geom import wrap_geom_features
+        from seismic_utils.geom import collate_with_geom, wrap_geom_features
 
-        stats = resolve_eval_geom_stats(hp, ckpt=ckpt, ckpt_dir=args.ckpt_dir)
-        if stats is None:
+        geom_stats = resolve_eval_geom_stats(hp, ckpt=ckpt, ckpt_dir=args.ckpt_dir)
+        if geom_stats is None:
             raise SystemExit(
                 "GeoNorm / geom input channels need train-only min-max stats; "
                 "missing geom_stats in the checkpoint and geom_stats.yaml next to it"
             )
-        parser = wrap_geom_features(parser, stats)
-    collate_fn = functools.partial(
-        fbp_data_module.fbp_batch_collate,
-        pad_to_nearest_pow2=True,
-    )
+        parser = wrap_geom_features(parser, geom_stats)
+        collate_fn = functools.partial(
+            collate_with_geom,
+            pad_to_nearest_pow2=True,
+            stats=geom_stats,
+        )
+    else:
+        collate_fn = functools.partial(
+            fbp_data_module.fbp_batch_collate,
+            pad_to_nearest_pow2=True,
+        )
     worker_kwargs: Dict[str, Any] = {}
     if args.num_workers > 0:
         worker_kwargs["persistent_workers"] = True
         worker_kwargs["prefetch_factor"] = 2
+        if geom_stats is not None:
+            from seismic_utils.geom import geom_worker_init
+
+            worker_kwargs["worker_init_fn"] = geom_worker_init
     loader = torch.utils.data.DataLoader(
         parser,
         batch_size=args.batch_size,
