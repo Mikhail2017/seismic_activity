@@ -124,6 +124,63 @@ The recipe on the training machine matters: `--picker before_after --fold A`
 alone does not select ResNet34, HDF5, four epochs, or batch size 32. Specify those
 flags or preserve the resolved recipe/model config when reproducing a run.
 
+## Geometry-conditioned U-Net (GeoNorm)
+
+`geonorm.md` maps per-trace offset/elevation into the existing FBPUNet. Opt-in
+via recipe `geonorm:` or `--geonorm A|B|C|D` (default **A**, unchanged baseline).
+
+| Ablation | Offset/elev input channels | GeoNorm |
+| --- | --- | --- |
+| A | no | no |
+| B | yes | no |
+| C | no | yes (every 2D norm → GroupNorm + per-trace scale/shift) |
+| D | yes | yes |
+
+`δx`/`δz` are min-max normalized on **training gathers only** and written next
+to the checkpoint (`geom_stats.yaml`). Flip/drop/pad keep `geom_features`
+aligned with traces. Eval restores the same stats:
+
+```bash
+python train/fbp_train.py --fold A --picker before_after --geonorm D
+python train/fbp_eval.py --ckpt-dir output/train_foldA_resnet18-before-after-geomD_... --fold A
+```
+
+GeoNorm modulates the **trace** axis of `(B, C, traces, time)` — not time.
+Existing `use_dist_offsets` channels stay independent of ablation B's two maps.
+
+## Lateral pick cleaner (eval only, no retrain)
+
+After decode, isolated pick crashes (line-end dives, single-trace jumps) are
+flagged against a robust pick-vs-offset fit and replaced from neighboring
+anchors. **Predictions are rewritten; labels are not.**
+Do not enable hardpicks `auto_fill_missing_picks` on the valid parser.
+
+Same checkpoint as a normal eval, plus `--lateral-clean`:
+
+```bash
+python train/fbp_eval.py --picker before_after \
+  --ckpt output/train_foldA_resnet18-before-after-geomd_.../best-epoch=019-step=043500.ckpt \
+  --fold A --backend hdf5 --data-dir /tmp/data \
+  --lateral-clean
+```
+
+Compare the new `report/eval_…` to the run without the flag (headline MAE / RMSE
+and the worst-gather PNGs). Expect RMSE/P90 on tail crashes to drop; systematic
+early picks on a whole gather (`01` / `02` style) stay unchanged.
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--lateral-clean` | off | Enable the post-process |
+| `--lateral-window` | 15 | Traces in the local-median window |
+| `--lateral-max-dev` | 15 | Flag if \|pick − median\| exceeds this many samples |
+| `--lateral-max-flag-frac` | 0.30 | Skip the gather if this fraction of valid picks would be flagged |
+| `--lateral-min-anchors` | 3 | Unflagged picks required before interpolation |
+
+`metrics.json` records `lateral_clean.n_replaced`. `report.md` shows **Lateral clean: on**.
+
+This is not a substitute for `--smooth-threshold` (that only changes the
+before/after decoder). Use the cleaner for along-line outliers after decode.
+
 ## Regression validation
 
 Run from the repository root in the `seismic_activity` environment:

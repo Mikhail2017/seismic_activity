@@ -72,9 +72,9 @@ from seismic_utils.pickers import (
     PICKER_BEFORE_AFTER,
     PICKER_FBPUNET,
     attach_smooth_evaluators,
+    parse_model_suffixes,
     picker_from_hparams,
     spec_for,
-    split_before_after_model,
 )
 from seismic_utils.predict import resolve_checkpoint
 from seismic_utils.training_state import (
@@ -690,8 +690,12 @@ def _decoder_for_encoder(encoder_type: str) -> Dict[str, Any]:
 
 
 def resolve_train_picker(model: str, picker: Optional[str] = None) -> tuple[str, str]:
-    """Return ``(arch_model_name, picker)`` from CLI/recipe picker or ``-before-after``."""
-    arch, from_suffix = split_before_after_model(model)
+    """Return ``(encoder_preset, picker)`` from CLI/recipe picker or ``-before-after``.
+
+    Strips ``-before-after`` and ``-horizon`` so the encoder id is a real
+    SMP/preset name (``resnet18-before-after-horizon`` → ``resnet18``).
+    """
+    arch, from_suffix, _ = parse_model_suffixes(model)
     if picker:
         return arch, spec_for(picker).name
     if from_suffix:
@@ -720,6 +724,7 @@ def build_model_config(
     recipe = dict(recipe or {})
     recipe_picker = recipe.get("picker")
     arch_model, resolved_picker = resolve_train_picker(model, picker or recipe_picker)
+    _, _, use_horizon_suffix = parse_model_suffixes(model)
     model_label = resolve_model_name(arch_model)
     use_prior = False
     if model_label in MODEL_PRESETS:
@@ -727,12 +732,8 @@ def build_model_config(
         use_prior = bool(arch.get("use_first_break_prior"))
     else:
         encoder_key = model_label
-        # ``resnet18-horizon`` → encoder resnet18 + first-break prior channel.
-        if model_label.endswith("-horizon") and model_label != "-horizon":
-            encoder_key = model_label[: -len("-horizon")]
-            use_prior = True
-            if encoder_key in MODEL_ALIASES:
-                encoder_key = MODEL_ALIASES[encoder_key]
+        if encoder_key in MODEL_ALIASES:
+            encoder_key = MODEL_ALIASES[encoder_key]
         if encoder_key in MODEL_PRESETS:
             arch = copy.deepcopy(MODEL_PRESETS[encoder_key])
         else:
@@ -740,8 +741,12 @@ def build_model_config(
             arch = {"unet_encoder_type": encoder_key, **_decoder_for_encoder(encoder_key)}
         model_label = model_label.replace("/", "-")
 
+    use_prior = use_prior or use_horizon_suffix
+
     if resolved_picker == PICKER_BEFORE_AFTER and "before-after" not in model_label.lower():
         model_label = f"{model_label}-before-after"
+    if use_horizon_suffix and "horizon" not in model_label.lower():
+        model_label = f"{model_label}-horizon"
 
     file_overrides: Dict[str, Any] = {}
     if model_config_path is not None:

@@ -199,7 +199,8 @@ python train/fbp_eval.py --ckpt output/train_foldA_resnet34/best-epoch=013-step=
 
 `--fold` uses the same whole-site holdout as training (see **Site folds** above).
 `--sites` evaluates those sites; add `--eval-ratio 0.15` to reuse the intra-site
-holdout from `fbp_train.py`.
+holdout from `fbp_train.py`. Add `--lateral-clean` to replace isolated pick
+outliers from neighboring traces (predictions only; see TRAINING.md).
 
 Writes `report/eval_<label>_<encoder>_<YYYYMMDD_HHMMSS>/`:
 
