@@ -50,7 +50,8 @@ with `SEISMIC_BACKEND=hardpicks`.
 - `seismic_utils/fbp_eval_report.py` — validation report (scalars, Plotly HTML, gather PNGs)
 - `models/` — local FBPUNet (cloned from hardpicks) used by `train/fbp_train.py`
 - `train/fbp_train.py` — training CLI (folds, multi-GPU, living `report/` log)
-- `configs/train.yaml` — default training recipe (epochs, batch, patience, save_top_k, loss/LR)
+- `train/run_folds.py` — leave-one-site-out sweep: train each fold, eval with lateral cleaning, write a comparison report
+- `configs/train.yaml` — default training recipe (epochs, batch, patience, loss/LR)
 - `TRAINING.md` — actual training pipeline (this repo)
 - `original_hardpicks.md` — paper / hardpicks search recipe
 - `train/fbp_eval.py` — checkpoint validation / prediction report CLI
@@ -175,16 +176,37 @@ validation site matches training.
 | B | Lalor, Brunswick, Halfmile | Sudbury |
 | C | Halfmile, Lalor, Sudbury | Brunswick |
 | D | Sudbury, Halfmile, Brunswick | Lalor |
-| E | — | unavailable (needs Matagami/Kevitsa) |
-| F | Halfmile, Brunswick | Sudbury |
-| G | Brunswick, Sudbury | Halfmile |
-| H | Halfmile, Lalor | Brunswick |
-| I | Sudbury, Halfmile | Lalor |
-| J | Lalor, Brunswick | Sudbury |
-| K | Brunswick, Sudbury | Halfmile |
 
 G and K have the same split; they exist as separate letters because hardpicks
 defines both YAMLs.
+
+## Fold sweep (`train/run_folds.py`)
+
+Production driver for folds **A–D**: one leave-one-site-out model after another,
+then a linked comparison report. Each fold runs `fbp_train.py` (recipe from
+[`configs/train.yaml`](configs/train.yaml)) and then `fbp_eval.py` on that fold’s
+best checkpoint with **lateral cleaning** on. Defaults match [`TRAINING.md`](TRAINING.md):
+HDF5 backend, picker `before_after`, GeoNorm **D**. Extra arguments after `--`
+are forwarded only to training.
+
+```bash
+python train/run_folds.py --data-dir /tmp/data
+python train/run_folds.py --folds A,B --data-dir /tmp/data --dry-run
+python train/run_folds.py --eval-only --data-dir /tmp/data
+python train/run_folds.py --eval-only --folds C --sweep report/folds_AD_…/sweep.json \
+    --data-dir /tmp/data --before-after-decoder change_point
+```
+
+`--folds` accepts `A-D`, `A,C`, or `A B D`. `--eval-only` skips training and
+scores existing `output/train_foldX_*` directories (or `--ckpt-dir A=/path`,
+or paths recorded in `--sweep`). `--continue-on-error` keeps going after a
+failed fold; otherwise the sweep stops.
+
+Writes `report/folds_<label>_<YYYYMMDD_HHMMSS>/`:
+
+- `report.md` — per-fold train/eval links and headline metrics after lateral clean
+- `sweep.json` — experiment dirs, checkpoints, train HR@1, eval metrics
+- `foldX_train.log` / `foldX_eval.log` — full stdout/stderr for each stage
 
 ## Validation / prediction report
 
